@@ -74,8 +74,12 @@ scripts/environments/teleoperation/.cache/
 # scene assets
 assets/scenes/*
 !assets/scenes/.gitkeep
+!assets/scenes/table_with_cube/
+!assets/scenes/table_with_cube/**
+assets/scenes/table_with_cube/**/.thumbs/
 assets/robots/*
 !assets/robots/.gitkeep
+!assets/robots/so101_follower.usd
 
 # greenscreen
 greenscreen/*
