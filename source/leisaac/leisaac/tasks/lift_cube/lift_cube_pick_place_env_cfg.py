@@ -84,8 +84,10 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
                 visual_material=sim_utils.PreviewSurfaceCfg(
                     diffuse_color=(0.05, 0.8, 0.1),
-                    emissive_color=(0.0, 0.1, 0.0),
-                    opacity=0.55,
+                    emissive_color=(0.0, 0.0, 0.0),
+                    roughness=1.0,
+                    metallic=0.0,
+                    opacity=1.0,
                 ),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(pos=target_pos),
