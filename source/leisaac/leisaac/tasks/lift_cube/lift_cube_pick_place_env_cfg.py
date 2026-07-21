@@ -13,8 +13,9 @@ from .lift_cube_env_cfg import LiftCubeEnvCfg, LiftCubeSceneCfg, ObservationsCfg
 
 TARGET_OFFSET_X = 0.18
 TARGET_MARKER_Z_OFFSET = -0.018
-TARGET_MARKER_SIZE = 0.10
+TARGET_MARKER_SIZE = 0.09
 TARGET_MARKER_HEIGHT = 0.004
+TARGET_MARKER_COLOR = (1.0, 1.0, 1.0)
 
 
 @configclass
@@ -63,7 +64,7 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
     observations: LiftCubePickPlaceObservationsCfg = LiftCubePickPlaceObservationsCfg()
     terminations: LiftCubePickPlaceTerminationsCfg = LiftCubePickPlaceTerminationsCfg()
 
-    task_description: str = "Pick up the red cube, place it on the green target, and return the arm to rest."
+    task_description: str = "Pick up the red cube, place it on the white square target, and return the arm to rest."
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -90,7 +91,7 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
                 collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
                 visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.05, 0.8, 0.1),
+                    diffuse_color=TARGET_MARKER_COLOR,
                     emissive_color=(0.0, 0.0, 0.0),
                     roughness=1.0,
                     metallic=0.0,
@@ -112,7 +113,7 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
                 collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
                 mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
                 visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.15, 0.65, 0.9),
+                    diffuse_color=TARGET_MARKER_COLOR,
                     emissive_color=(0.0, 0.0, 0.0),
                     roughness=1.0,
                     metallic=0.0,
