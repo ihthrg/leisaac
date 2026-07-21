@@ -4,13 +4,14 @@ from pathlib import Path
 
 def _detect_git_root() -> Path:
     """Locate repository root; fallback to current file ancestor."""
+    package_path = Path(__file__).resolve()
     try:
         from git import Repo
 
-        repo = Repo(os.getcwd(), search_parent_directories=True)
+        repo = Repo(package_path.parent, search_parent_directories=True)
         return Path(repo.git.rev_parse("--show-toplevel"))
     except Exception:
-        return Path(__file__).resolve().parents[4]
+        return package_path.parents[4]
 
 
 def _resolve_assets_root() -> str:
