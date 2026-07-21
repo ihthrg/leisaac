@@ -13,6 +13,8 @@ from .lift_cube_env_cfg import LiftCubeEnvCfg, LiftCubeSceneCfg, ObservationsCfg
 
 TARGET_OFFSET_X = 0.18
 TARGET_MARKER_Z_OFFSET = -0.018
+TARGET_MARKER_SIZE = 0.10
+TARGET_MARKER_HEIGHT = 0.004
 
 
 @configclass
@@ -72,10 +74,15 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
             cube_pos[1],
             cube_pos[2] + TARGET_MARKER_Z_OFFSET,
         )
+        circle_target_pos = (
+            cube_pos[0] - TARGET_OFFSET_X,
+            cube_pos[1],
+            cube_pos[2] + TARGET_MARKER_Z_OFFSET,
+        )
         self.scene.target = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Target",
             spawn=sim_utils.CuboidCfg(
-                size=(0.10, 0.10, 0.004),
+                size=(TARGET_MARKER_SIZE, TARGET_MARKER_SIZE, TARGET_MARKER_HEIGHT),
                 rigid_props=sim_utils.RigidBodyPropertiesCfg(
                     kinematic_enabled=True,
                     disable_gravity=True,
@@ -91,6 +98,28 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
                 ),
             ),
             init_state=RigidObjectCfg.InitialStateCfg(pos=target_pos),
+        )
+        self.scene.circle_target = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/CircleTarget",
+            spawn=sim_utils.CylinderCfg(
+                radius=TARGET_MARKER_SIZE / 2,
+                height=TARGET_MARKER_HEIGHT,
+                axis="Z",
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=True,
+                    disable_gravity=True,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                mass_props=sim_utils.MassPropertiesCfg(mass=0.01),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.15, 0.65, 0.9),
+                    emissive_color=(0.0, 0.0, 0.0),
+                    roughness=1.0,
+                    metallic=0.0,
+                    opacity=1.0,
+                ),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(pos=circle_target_pos),
         )
 
         setattr(
