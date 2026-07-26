@@ -4,7 +4,6 @@ import torch
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply, quat_from_euler_xyz, quat_inv, quat_mul
 from leisaac.tasks.lift_cube.mdp import cube_placed_on_correct_target
-from leisaac.utils.robot_utils import is_so101_at_rest_pose
 
 from .base import StateMachineBase
 
@@ -20,9 +19,18 @@ _REST_POSE_DEG = {
     "shoulder_lift": -100.0,
     "elbow_flex": 90.0,
     "wrist_flex": 50.0,
-    "wrist_roll": 0.0,
+    "wrist_roll": 90.0,  # counter-clockwise 90 deg (was 0.0); flip the sign if this turns out
+    # to be clockwise instead once verified in sim.
     "gripper": -10.0,
 }
+
+_REST_POSE_TOLERANCE_DEG = 30.0
+"""Per-joint +/- tolerance (deg) used by ``_is_at_rest`` to decide if the arm reached
+``_REST_POSE_DEG``. Matches the tolerance used by the shared
+``leisaac.utils.robot_utils.is_so101_at_rest_pose``/``SO101_FOLLOWER_REST_POSE_RANGE`` for every
+joint except ``wrist_roll`` -- this task holds ``wrist_roll`` at 90 deg (not 0 deg) at rest, so it
+uses its own local check instead of the shared one, to avoid shifting the shared rest-pose
+tolerance used by other tasks."""
 
 _HOLD_HEIGHT_ABOVE_TABLE = 0.20
 """Height (m) above the cube while lifting/carrying/holding it, expressed as a target for the
@@ -49,6 +57,22 @@ _LOWER_TO_TARGET_END = 360  # +30 (1.0s)
 _RELEASE_END = 380  # +20 (0.67s)
 _LIFT_GRIPPER_END = 400  # +20 (0.67s)
 _TOTAL_STEPS = 550  # +150 (5.0s): return home, ends the episode
+
+
+def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
+    """Check whether every joint is within ``_REST_POSE_TOLERANCE_DEG`` of ``_REST_POSE_DEG``."""
+    is_rest = torch.ones(joint_pos.shape[0], dtype=torch.bool, device=joint_pos.device)
+    joint_pos_deg = joint_pos / torch.pi * 180.0
+    for joint_name, target_deg in _REST_POSE_DEG.items():
+        joint_idx = joint_names.index(joint_name)
+        is_rest = torch.logical_and(
+            is_rest,
+            torch.logical_and(
+                joint_pos_deg[:, joint_idx] > target_deg - _REST_POSE_TOLERANCE_DEG,
+                joint_pos_deg[:, joint_idx] < target_deg + _REST_POSE_TOLERANCE_DEG,
+            ),
+        )
+    return is_rest
 
 
 class LiftCubePickPlaceStateMachine(StateMachineBase):
@@ -150,7 +174,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
                 velocity=torch.zeros_like(self._rest_joint_pos),
             )
             env.scene.update(dt=env.physics_dt)
-        at_rest = is_so101_at_rest_pose(robot.data.joint_pos, robot.data.joint_names)
+        at_rest = _is_at_rest(robot.data.joint_pos, robot.data.joint_names)
 
         return bool(torch.logical_and(placed, at_rest).all().item())
 
