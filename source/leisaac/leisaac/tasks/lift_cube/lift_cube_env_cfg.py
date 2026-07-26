@@ -59,8 +59,6 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
     wrist: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/gripper/wrist_camera",
         offset=TiledCameraCfg.OffsetCfg(
-            # pos=(-0.001, 0.1, -0.04), rot=(-0.404379, -0.912179, -0.0451242, 0.0486914), convention="ros"
-            # pos=(0.001, -0.14, 0.025), rot=( 0.0, 0.0, 0.9659258,0.258819), convention="ros" 
             pos=(0.0, -0.058, -0.021), rot=( 0.0, 0.0, 0.9812086,0.1929501), convention="ros" 
         ),
         data_types=["rgb"],
@@ -73,8 +71,7 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
     top: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base/top_camera",
         offset=TiledCameraCfg.OffsetCfg(
-            # pos=(0.0, 0.0, 0.6), rot=(0.1650476, -0.9862856, 0.0, 0.0), convention="ros"
-            pos=(0.02, -0.2, 0.45), rot=(0.0, 0.0, 1.0, 0.0), convention="ros"
+            pos=(0.02, -0.21, 0.45), rot=(0.0, 0.0, 1.0, 0.0), convention="ros"
         ),
         data_types=["rgb"],
         spawn=u20cam_spawn_cfg,
