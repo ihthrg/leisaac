@@ -30,12 +30,22 @@ U20CAM_WIDTH = 640
 U20CAM_HEIGHT = 480
 
 # U20CAM-1080P-S1 の仕様に合わせた魚眼カメラ設定
+# Note: IsaacLab 2.3 uses `FisheyeCameraCfg` with `projection_type` and the
+# `fisheye_*` width/height/centre parameters instead of the older
+# `fisheye_nominal_focal_length` / `fisheye_model` API.
 u20cam_spawn_cfg = sim_utils.FisheyeCameraCfg(
-    fisheye_nominal_focal_length=2.8,  # 焦点距離 2.8mm
-    fisheye_max_fov=120.0,              # 対角画角 約120度 (水平 106度)
-    fisheye_model="f-theta",            # 魚眼レンズモデル ("f-theta" または "polynomial")
+    projection_type="fisheyePolynomial",
+    focal_length=3.2,
+    focus_distance=400.0,
+    # horizontal_aperture=38.11,
+    horizontal_aperture=38.11,
     clipping_range=(0.01, 50.0),
     lock_camera=True,
+    fisheye_nominal_width=U20CAM_WIDTH,
+    fisheye_nominal_height=U20CAM_HEIGHT,
+    fisheye_optical_centre_x=U20CAM_WIDTH / 2.0,
+    fisheye_optical_centre_y=U20CAM_HEIGHT / 2.0,
+    fisheye_max_fov=120.0,
 )
 
 
@@ -45,28 +55,12 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
 
     scene: AssetBaseCfg = TABLE_WITH_CUBE_CFG.replace(prim_path="{ENV_REGEX_NS}/Scene")
 
-    front: TiledCameraCfg = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base/front_camera",
-        offset=TiledCameraCfg.OffsetCfg(
-            pos=(-0.6, -0.75, 0.38), rot=(0.77337, 0.55078, -0.2374, -0.20537), convention="opengl"
-        ),  # wxyz
-        data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=40.6,
-            focus_distance=400.0,
-            horizontal_aperture=38.11,
-            clipping_range=(0.01, 50.0),
-            lock_camera=True,
-        ),
-        width=640,
-        height=480,
-        update_period=1 / 30.0,  # 30FPS
-    )
-
     wrist: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/gripper/wrist_camera",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(-0.001, 0.1, -0.04), rot=(-0.404379, -0.912179, -0.0451242, 0.0486914), convention="ros"
+            # pos=(-0.001, 0.1, -0.04), rot=(-0.404379, -0.912179, -0.0451242, 0.0486914), convention="ros"
+            # pos=(0.001, -0.14, 0.025), rot=( 0.0, 0.0, 0.9659258,0.258819), convention="ros" 
+            pos=(0.0, -0.058, -0.021), rot=( 0.0, 0.0, 0.9812086,0.1929501), convention="ros" 
         ),
         data_types=["rgb"],
         spawn=u20cam_spawn_cfg,
@@ -78,7 +72,8 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
     top: TiledCameraCfg = TiledCameraCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base/top_camera",
         offset=TiledCameraCfg.OffsetCfg(
-            pos=(0.225, -0.5, 0.6), rot=(0.1650476, -0.9862856, 0.0, 0.0), convention="ros"
+            # pos=(0.0, 0.0, 0.6), rot=(0.1650476, -0.9862856, 0.0, 0.0), convention="ros"
+            pos=(0.02, -0.2, 0.45), rot=(0.0, 0.0, 1.0, 0.0), convention="ros"
         ),
         data_types=["rgb"],
         spawn=u20cam_spawn_cfg,
@@ -86,7 +81,6 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
         height=U20CAM_HEIGHT,
         update_period=1 / 30.0,
     )
-
     light = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Light",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=1000.0),
@@ -172,18 +166,8 @@ class LiftCubeEnvCfg(SingleArmTaskEnvCfg):
                         "yaw": (-30 * torch.pi / 180, 30 * torch.pi / 180),
                     },
                 ),
-                randomize_camera_uniform(
-                    "front",
-                    pose_range={
-                        "x": (-0.005, 0.005),
-                        "y": (-0.005, 0.005),
-                        "z": (-0.005, 0.005),
-                        "roll": (-0.05 * torch.pi / 180, 0.05 * torch.pi / 180),
-                        "pitch": (-0.05 * torch.pi / 180, 0.05 * torch.pi / 180),
-                        "yaw": (-0.05 * torch.pi / 180, 0.05 * torch.pi / 180),
-                    },
-                    convention="opengl",
-                ),
+                # removed front camera randomization so `front` camera is not
+                # included in recorded/randomized sensors
             ],
         )
 
@@ -194,7 +178,9 @@ class LiftCubeDigitalTwinEnvCfg(LiftCubeEnvCfg, ManagerBasedRLDigitalTwinEnvCfg)
 
     rgb_overlay_mode: str = "background"
 
-    rgb_overlay_paths: dict[str, str] = {"front": "greenscreen/background-lift-cube.png"}
+    # avoid using the `front` camera overlay so front camera won't be used
+    # in digital-twin recording; use the wrist camera instead
+    rgb_overlay_paths: dict[str, str] = {"wrist": "greenscreen/background-lift-cube.png"}
 
     render_objects: list[SceneEntityCfg] = [
         SceneEntityCfg("cube"),
