@@ -16,6 +16,7 @@ from leisaac.utils.domain_randomization import (
     randomize_camera_uniform,
     randomize_object_uniform,
 )
+from leisaac.utils.env_utils import delete_attribute
 from leisaac.utils.general_assets import parse_usd_and_create_subassets
 
 from ..template import (
@@ -35,17 +36,17 @@ U20CAM_HEIGHT = 480
 # `fisheye_nominal_focal_length` / `fisheye_model` API.
 u20cam_spawn_cfg = sim_utils.FisheyeCameraCfg(
     projection_type="fisheyePolynomial",
-    focal_length=3.2,
+    focal_length=2.8,             # 実機公称値
     focus_distance=400.0,
-    # horizontal_aperture=38.11,
-    horizontal_aperture=38.11,
+    horizontal_aperture=4.8,      # 1/3"センサー幅
+    vertical_aperture=3.6,        # 1/3"センサー高さ（4:3, 640x480に整合）
     clipping_range=(0.01, 50.0),
     lock_camera=True,
     fisheye_nominal_width=U20CAM_WIDTH,
     fisheye_nominal_height=U20CAM_HEIGHT,
     fisheye_optical_centre_x=U20CAM_WIDTH / 2.0,
     fisheye_optical_centre_y=U20CAM_HEIGHT / 2.0,
-    fisheye_max_fov=120.0,
+    fisheye_max_fov=130.0,         # 実機公称の対角FOV（現状120.0も要修正）
 )
 
 
@@ -86,6 +87,12 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=1000.0),
     )
 
+    def __post_init__(self):
+        super().__post_init__()
+        # `front` is inherited from SingleArmTaskSceneCfg but this task now uses
+        # wrist + top instead, so drop it from the scene (and thus from recording).
+        delete_attribute(self, "front")
+
 
 @configclass
 class ObservationsCfg(SingleArmObservationsCfg):
@@ -116,6 +123,11 @@ class ObservationsCfg(SingleArmObservationsCfg):
     # observation groups
     policy: PolicyCfg = PolicyCfg()
     subtask_terms: SubtaskCfg = SubtaskCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # drop the inherited `front` observation term to match the scene above
+        delete_attribute(self.policy, "front")
 
 
 @configclass
