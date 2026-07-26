@@ -6,7 +6,7 @@ from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from leisaac.utils.robot_utils import is_so101_at_rest_pose
 
-from .observations import cube_placed_on_target
+from .observations import cube_placed_on_correct_target
 
 
 def cube_height_above_base(
@@ -46,14 +46,18 @@ def cube_pick_place_done(
     env: ManagerBasedRLEnv | DirectRLEnv,
     cube_cfg: SceneEntityCfg,
     target_cfg: SceneEntityCfg,
+    circle_target_cfg: SceneEntityCfg,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    center_x: float = 0.0,
 ) -> torch.Tensor:
-    """Check that the cube was placed and the SO-101 returned to rest."""
-    placed = cube_placed_on_target(
+    """Check that the cube was placed on its correct target (by spawn side) and the SO-101 returned to rest."""
+    placed = cube_placed_on_correct_target(
         env,
         cube_cfg=cube_cfg,
         target_cfg=target_cfg,
+        circle_target_cfg=circle_target_cfg,
         robot_cfg=robot_cfg,
+        center_x=center_x,
     )
     robot: Articulation = env.scene[robot_cfg.name]
     at_rest = is_so101_at_rest_pose(robot.data.joint_pos, robot.data.joint_names)

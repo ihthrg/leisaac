@@ -16,6 +16,9 @@ TARGET_MARKER_Z_OFFSET = -0.018
 TARGET_MARKER_SIZE = 0.09
 TARGET_MARKER_HEIGHT = 0.004
 TARGET_MARKER_COLOR = (1.0, 1.0, 1.0)
+TARGET_RANDOM_RANGE = 0.06
+"""Independent per-episode randomization half-range (m) applied to both the square target and
+the circle target, in x and y."""
 
 
 @configclass
@@ -31,11 +34,13 @@ class LiftCubePickPlaceObservationsCfg(ObservationsCfg):
             },
         )
         place_cube = ObsTerm(
-            func=mdp.cube_placed_on_target,
+            func=mdp.cube_placed_on_correct_target,
             params={
                 "cube_cfg": SceneEntityCfg("cube"),
                 "target_cfg": SceneEntityCfg("target"),
+                "circle_target_cfg": SceneEntityCfg("circle_target"),
                 "robot_cfg": SceneEntityCfg("robot"),
+                "center_x": 0.0,  # overwritten in LiftCubePickPlaceEnvCfg.__post_init__
             },
         )
 
@@ -53,7 +58,9 @@ class LiftCubePickPlaceTerminationsCfg(SingleArmTerminationsCfg):
         params={
             "cube_cfg": SceneEntityCfg("cube"),
             "target_cfg": SceneEntityCfg("target"),
+            "circle_target_cfg": SceneEntityCfg("circle_target"),
             "robot_cfg": SceneEntityCfg("robot"),
+            "center_x": 0.0,  # overwritten in LiftCubePickPlaceEnvCfg.__post_init__
         },
     )
 
@@ -64,12 +71,17 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
     observations: LiftCubePickPlaceObservationsCfg = LiftCubePickPlaceObservationsCfg()
     terminations: LiftCubePickPlaceTerminationsCfg = LiftCubePickPlaceTerminationsCfg()
 
-    task_description: str = "Pick up the red cube, place it on the white square target, and return the arm to rest."
+    task_description: str = (
+        "Pick up the red cube, hold it briefly above the table center, then place it on the white circular"
+        " target if it was picked up from the right side or the white square target if picked up from the"
+        " left side, and return the arm to rest."
+    )
 
     def __post_init__(self) -> None:
         super().__post_init__()
 
         cube_pos = self.scene.cube.init_state.pos
+        center_x = cube_pos[0]
         target_pos = (
             cube_pos[0] + TARGET_OFFSET_X,
             cube_pos[1],
@@ -123,14 +135,31 @@ class LiftCubePickPlaceEnvCfg(LiftCubeEnvCfg):
             init_state=RigidObjectCfg.InitialStateCfg(pos=circle_target_pos),
         )
 
+        # Which target matches the cube's original spawn side (right of center_x -> circle,
+        # left -> square) is resolved at runtime by mdp.cube_placed_on_correct_target/cube_pick_place_done.
+        self.terminations.success.params["center_x"] = center_x
+        self.observations.subtask_terms.place_cube.params["center_x"] = center_x
+
         setattr(
             self.events,
             "domain_randomize_target",
             randomize_object_uniform(
                 "target",
                 pose_range={
-                    "x": (-0.03, 0.03),
-                    "y": (-0.03, 0.03),
+                    "x": (-TARGET_RANDOM_RANGE, TARGET_RANDOM_RANGE),
+                    "y": (-TARGET_RANDOM_RANGE, TARGET_RANDOM_RANGE),
+                    "z": (0.0, 0.0),
+                },
+            ),
+        )
+        setattr(
+            self.events,
+            "domain_randomize_circle_target",
+            randomize_object_uniform(
+                "circle_target",
+                pose_range={
+                    "x": (-TARGET_RANDOM_RANGE, TARGET_RANDOM_RANGE),
+                    "y": (-TARGET_RANDOM_RANGE, TARGET_RANDOM_RANGE),
                     "z": (0.0, 0.0),
                 },
             ),
