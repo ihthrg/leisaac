@@ -1,7 +1,7 @@
 """
 python scripts/datagen/state_machine/generate.py --task LeIsaac-SO101-LiftCubePickPlace-v0 \
     --num_envs 1 --device cuda --enable_cameras --num_demos 3 \
-    --record --use_lerobot_recorder --lerobot_dataset_fps 30 --step_hz 30
+    --record --use_lerobot_recorder --lerobot_dataset_fps 30 --step_hz 60
 """
 
 import isaaclab.sim as sim_utils
@@ -19,7 +19,6 @@ from leisaac.enhance.envs.manager_based_rl_digital_twin_env_cfg import (
 )
 from leisaac.utils.domain_randomization import (
     domain_randomization,
-    randomize_camera_uniform,
     randomize_object_uniform,
 )
 from leisaac.utils.env_utils import delete_attribute

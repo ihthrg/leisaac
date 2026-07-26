@@ -2,7 +2,7 @@
 
 import torch
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply, quat_from_euler_xyz, quat_inv, quat_mul
+from isaaclab.utils.math import quat_apply, quat_inv, quat_mul
 from leisaac.tasks.lift_cube.mdp import cube_placed_on_correct_target
 
 from .base import StateMachineBase
@@ -44,12 +44,10 @@ _HOVER_CLEARANCE = 0.10
 _RELEASE_CLEARANCE = 0.02
 """Jaw height (m) above the target marker when lowering to release the cube."""
 
-# Phase boundaries (state-machine step count). `LeRobotRecorderManager` records exactly one
-# frame per `env.step()` call, and each `env.step()` advances physics by one sim tick. The
-# simulation runs at 60Hz (`--step_hz 60`), so these must be calibrated as `round(seconds * 60)`
-# to get the intended real motion duration -- independent of the *separately* declared
-# `--lerobot_dataset_fps 30`, which only labels/exports the recording and has no bearing on how
-# much physical time a given number of `env.step()` calls represents.
+# Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim
+# tick, so a 60Hz simulation (`--step_hz 60`) requires `round(seconds * 60)` steps for the
+# intended physical duration. `LeRobotRecorderManager` separately downsamples those steps to the
+# requested dataset rate (`--lerobot_dataset_fps 30`, i.e. every second step here).
 _APPROACH_STEPS = 120  # phase ends at 120 (2.0s): interpolate from initial EE pos to cube hover
 _LOWER_TO_CUBE_END = 180  # +60 (1.0s)
 _GRASP_END = 240  # +60 (1.0s)
@@ -78,6 +76,13 @@ _PHASE_START_NAMES = (
     (_RELEASE_END, "lift_gripper"),
     (_LIFT_GRIPPER_END, "return_home"),
 )
+
+
+def _quat_nlerp(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Interpolate unit quaternions along the shortest path using normalized lerp."""
+    end_shortest = torch.where(torch.sum(start * end, dim=-1, keepdim=True) < 0.0, -end, end)
+    interpolated = start + (end_shortest - start) * alpha
+    return interpolated / torch.linalg.vector_norm(interpolated, dim=-1, keepdim=True).clamp_min(1.0e-8)
 
 
 def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
@@ -115,10 +120,13 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._step_count: int = 0
         self._episode_done: bool = False
         self._initial_ee_pos: torch.Tensor | None = None
+        self._initial_ee_quat_world: torch.Tensor | None = None
         self._rest_ee_pos_world: torch.Tensor | None = None
+        self._rest_ee_quat_world: torch.Tensor | None = None
         self._rest_joint_pos: torch.Tensor | None = None
         self._home_start_pos: torch.Tensor | None = None
         self._hold_pos_world: torch.Tensor | None = None
+        self._hold_quat_world: torch.Tensor | None = None
         self._center_x: float = 0.0
         self._target_is_circle: torch.Tensor | None = None
 
@@ -166,7 +174,9 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         # in the articulation's body list, which is not guaranteed to be "gripper" if e.g. "jaw"
         # is a separate body ordered after it. This keeps every EE-space position in this file
         # anchored to the exact same, explicitly-named prim that the IK action also targets.
-        self._rest_ee_pos_world = env.scene["ee_frame"].data.target_pos_w[:, 0, :].clone()
+        ee_frame = env.scene["ee_frame"]
+        self._rest_ee_pos_world = ee_frame.data.target_pos_w[:, 0, :].clone()
+        self._rest_ee_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
@@ -216,7 +226,9 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         """
         robot = env.scene["robot"]
         if self._step_count == 0:
-            self._hold_pos_world = env.scene["ee_frame"].data.target_pos_w[:, 1, :].clone()
+            ee_frame = env.scene["ee_frame"]
+            self._hold_pos_world = ee_frame.data.target_pos_w[:, 1, :].clone()
+            self._hold_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
             if self._rest_joint_pos is not None:
                 robot.write_joint_state_to_sim(
                     position=self._rest_joint_pos,
@@ -236,12 +248,17 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         Cube/target positions below describe where the *jaw* (fingertip contact point, see
         ``ee_frame``'s second target frame) should be -- not the raw "gripper" IK control frame,
-        which sits at a fixed but non-trivial offset from the jaw. That offset is read live from
-        the ``ee_frame`` sensor (constant here since the commanded gripper orientation never
-        changes) and subtracted from every jaw target to get the actual IK command. Using a
-        hard-coded gripper-frame offset instead (as tuned for the much larger orange in
-        ``pick_orange.py``) placed the gripper's IK point far from this small 3cm cube and the
-        jaw never closed around it.
+        which sits at a fixed but non-trivial offset from the jaw. The rigid offset is measured
+        live, expressed in the gripper's local frame, then rotated by the *target* gripper
+        orientation before being subtracted from every jaw target. This is necessary because
+        using the current world-space offset is only correct when current and target
+        orientations already match.
+
+        The target orientation follows the robot's actual poses: the approach smoothly moves
+        from the rest-pose orientation to the configured initial/middle-pose orientation, task
+        phases keep that initial orientation, and return-home restores the rest orientation.
+        This avoids the previous instantaneous command to world identity at step 0, which made
+        the arm turn left before it even began approaching the cube.
         """
         robot = env.scene["robot"]
         robot.write_joint_damping_to_sim(damping=10.0)
@@ -257,18 +274,31 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         robot_base_quat_w = robot.data.root_quat_w.clone()
 
         ee_frame = env.scene["ee_frame"]
-        gripper_to_jaw = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
-
-        target_quat_w = quat_from_euler_xyz(
-            torch.tensor(0.0, device=device),
-            torch.tensor(0.0, device=device),
-            torch.tensor(0.0, device=device),
-        ).repeat(num_envs, 1)
-        target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
+        current_gripper_quat_w = ee_frame.data.target_quat_w[:, 0, :].clone()
 
         if step == 0:
             self._initial_ee_pos = ee_frame.data.target_pos_w[:, 0, :].clone()
+            self._initial_ee_quat_world = current_gripper_quat_w.clone()
             self._target_is_circle = cube_pos_w[:, 0] > self._center_x
+
+        if step < _APPROACH_STEPS and self._initial_ee_quat_world is not None and self._hold_quat_world is not None:
+            target_quat_w = _quat_nlerp(
+                self._initial_ee_quat_world,
+                self._hold_quat_world,
+                self._step_count / float(_APPROACH_STEPS),
+            )
+        elif step < _LIFT_GRIPPER_END and self._hold_quat_world is not None:
+            target_quat_w = self._hold_quat_world.clone()
+        elif self._rest_ee_quat_world is not None:
+            target_quat_w = self._rest_ee_quat_world.clone()
+        else:
+            target_quat_w = current_gripper_quat_w
+
+        target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
+
+        gripper_to_jaw_world = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
+        gripper_to_jaw_local = quat_apply(quat_inv(current_gripper_quat_w), gripper_to_jaw_world)
+        gripper_to_jaw = quat_apply(target_quat_w, gripper_to_jaw_local)
 
         selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
 
@@ -279,6 +309,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
                 print(
                     f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
                     f"cube_pos={cube_pos_w[0].tolist()} gripper_to_jaw={gripper_to_jaw[0].tolist()} "
+                    f"current_quat_w={current_gripper_quat_w[0].tolist()} "
+                    f"target_quat_w={target_quat_w[0].tolist()} "
                     f"hold_pos_world={self._hold_pos_world[0].tolist() if self._hold_pos_world is not None else None} "
                     f"rest_ee_pos_world={self._rest_ee_pos_world[0].tolist() if self._rest_ee_pos_world is not None else None}"
                 )
@@ -322,6 +354,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._step_count = 0
         self._episode_done = False
         self._initial_ee_pos = None
+        self._initial_ee_quat_world = None
         self._home_start_pos = None
         self._target_is_circle = None
 

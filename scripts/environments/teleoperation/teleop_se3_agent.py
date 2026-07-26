@@ -239,7 +239,12 @@ def main():  # noqa: C901
                 repo_id=args_cli.lerobot_dataset_repo_id,
                 fps=args_cli.lerobot_dataset_fps,
             )
-            env.recorder_manager = LeRobotRecorderManager(env_cfg.recorders, dataset_cfg, env)
+            env.recorder_manager = LeRobotRecorderManager(
+                env_cfg.recorders,
+                dataset_cfg,
+                env,
+                step_hz=args_cli.step_hz,
+            )
         else:
             env.recorder_manager = StreamingRecorderManager(env_cfg.recorders, env)
             env.recorder_manager.flush_steps = 100
