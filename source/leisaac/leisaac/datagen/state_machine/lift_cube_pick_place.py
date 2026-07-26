@@ -24,6 +24,16 @@ _REST_POSE_DEG = {
     "gripper": -10.0,
 }
 
+_MIDDLE_POSE_DEG = {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": 0.0,
+    "elbow_flex": 0.0,
+    "wrist_flex": 0.0,
+    "wrist_roll": 90.0,
+    "gripper": 0.0,
+}
+"""Middle joint pose: all joints at 0 deg except a 90 deg counter-clockwise wrist roll."""
+
 _REST_POSE_TOLERANCE_DEG = 30.0
 """Per-joint +/- tolerance (deg) used by ``_is_at_rest`` to decide if the arm reached
 ``_REST_POSE_DEG``. Matches the tolerance used by the shared
@@ -104,9 +114,9 @@ def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor
 class LiftCubePickPlaceStateMachine(StateMachineBase):
     """State machine for the conditional lift-cube pick-and-place (sort) task.
 
-    Picks up the cube, holds it for ~3 seconds at the SO-101 calibration "middle position" (all
-    joints at 0 rad -- see ``so101_joint_state_server.py``'s "MIDDLE of its range of motion"
-    calibration step), then places it on whichever target matches its original spawn side:
+    Picks up the cube, holds it for ~3 seconds at the SO-101 "middle position" (all joints at
+    0 deg except a 90 deg counter-clockwise wrist roll), then places it on whichever target
+    matches its original spawn side:
     the circle target if the cube spawned to the right (+X) of the nominal center, or the
     square target if it spawned to the left. Finally returns the arm to the SO-101 rest pose.
 
@@ -135,18 +145,16 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     # ------------------------------------------------------------------
 
     def setup(self, env) -> None:
-        """FK calibration for the rest pose; other one-time, env-derived setup.
+        """FK calibration for the rest and middle poses; other one-time setup.
 
-        Teleports the joints to the SO-101 rest pose and reads the resulting world-space EE
-        position via FK. This EE-space target is then used as an ordinary IK target during the
-        return-home phase, so the arm reaches it through the same smooth, physically-simulated
-        motion as every other phase (a direct joint-space teleport would not carry a grasped
-        cube realistically).
+        Teleports the joints first to the SO-101 rest pose and then to the requested middle
+        pose (all joints at 0 deg except ``wrist_roll`` at +90 deg), reading the corresponding
+        world-space gripper/jaw poses via FK. These are used as ordinary IK targets during the
+        episode, so the arm reaches them through smooth, physically-simulated motion rather
+        than teleporting while carrying the cube.
 
-        The "middle position" hold target is *not* calibrated here -- see ``pre_step()``, which
-        captures it directly from each episode's natural post-``env.reset()`` state (the SO-101
-        follower's default joint pose is already all-zero, i.e. the calibration "middle
-        position"), instead of re-deriving it via a separate teleport.
+        The caller resets the environment after ``setup()``, so neither calibration pose leaks
+        into the first recorded episode.
 
         ``center_x`` (the left/right decision threshold) is derived from the cube's *nominal*
         (pre-randomization) spawn point, i.e. ``env.cfg.scene.cube.init_state.pos`` -- the same
@@ -177,6 +185,20 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         ee_frame = env.scene["ee_frame"]
         self._rest_ee_pos_world = ee_frame.data.target_pos_w[:, 0, :].clone()
         self._rest_ee_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
+
+        middle_joint_pos = torch.zeros_like(self._rest_joint_pos)
+        for idx, name in enumerate(joint_names):
+            if name in _MIDDLE_POSE_DEG:
+                middle_joint_pos[:, idx] = _MIDDLE_POSE_DEG[name] * torch.pi / 180.0
+
+        robot.write_joint_state_to_sim(
+            position=middle_joint_pos,
+            velocity=torch.zeros_like(middle_joint_pos),
+        )
+        env.sim.step(render=False)
+        env.scene.update(dt=env.physics_dt)
+        self._hold_pos_world = ee_frame.data.target_pos_w[:, 1, :].clone()
+        self._hold_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
@@ -209,32 +231,19 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         return bool(torch.logical_and(placed, at_rest).all().item())
 
     def pre_step(self, env) -> None:
-        """Capture the "middle position" hold target, then snap to rest before the first step.
+        """Snap to rest before the first step, then blend back to rest at the end.
 
-        ``env.reset()`` (called by the caller immediately before every episode's first
-        ``pre_step()``/``get_action()``) resets the robot to its configured default joint pose,
-        which for the SO-101 follower is all-zero -- exactly the calibration "middle position"
-        (see ``so101_joint_state_server.py``'s "MIDDLE of its range of motion" step). So the
-        jaw's *initial* world position, read here before anything else touches the robot,
-        already **is** the middle-position jaw target; no separate FK teleport is needed to
-        re-derive it.
-
-        Only after that capture do we snap the arm to the rest pose, ensuring every recorded
-        episode starts from a consistent rest state (rather than whatever pose the previous
-        episode's reset happened to leave the arm in), matching the same direct
-        joint-state-write technique used at the end of the episode.
+        The middle target was calibrated once in ``setup()`` from the explicit middle joint
+        pose. The initial snap ensures every recorded episode starts from a consistent rest
+        state, matching the direct joint-state-write technique used at the end.
         """
         robot = env.scene["robot"]
-        if self._step_count == 0:
-            ee_frame = env.scene["ee_frame"]
-            self._hold_pos_world = ee_frame.data.target_pos_w[:, 1, :].clone()
-            self._hold_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
-            if self._rest_joint_pos is not None:
-                robot.write_joint_state_to_sim(
-                    position=self._rest_joint_pos,
-                    velocity=torch.zeros_like(self._rest_joint_pos),
-                )
-                env.scene.update(dt=env.physics_dt)
+        if self._step_count == 0 and self._rest_joint_pos is not None:
+            robot.write_joint_state_to_sim(
+                position=self._rest_joint_pos,
+                velocity=torch.zeros_like(self._rest_joint_pos),
+            )
+            env.scene.update(dt=env.physics_dt)
         if self._step_count >= _LIFT_GRIPPER_END and self._rest_joint_pos is not None:
             if self._step_count == _LIFT_GRIPPER_END:
                 self._home_start_pos = robot.data.joint_pos.clone()
