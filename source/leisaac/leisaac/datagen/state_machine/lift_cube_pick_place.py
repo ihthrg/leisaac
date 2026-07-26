@@ -14,7 +14,6 @@ from .base import StateMachineBase
 
 _GRIPPER_OPEN = 1.0
 _GRIPPER_CLOSE = -1.0
-_GRIPPER_OFFSET = 0.1  # vertical clearance for the gripper tip (matches pick_orange.py)
 
 _REST_POSE_DEG = {
     "shoulder_pan": 0.0,
@@ -26,7 +25,15 @@ _REST_POSE_DEG = {
 }
 
 _HOLD_HEIGHT_ABOVE_TABLE = 0.20
-"""Height (m) above the cube's nominal spawn point used for the "middle position" hold."""
+"""Height (m) above the cube's nominal spawn point used while lifting/carrying/holding the cube
+and for the "middle position" hold, expressed as a target for the *jaw* (see below), not the
+raw IK control frame."""
+
+_HOVER_CLEARANCE = 0.10
+"""Jaw height (m) above the cube when hovering, before/after lowering to grasp."""
+
+_RELEASE_CLEARANCE = 0.02
+"""Jaw height (m) above the target marker when lowering to release the cube."""
 
 # Phase boundaries (state-machine step count). `LeRobotRecorderManager` records exactly one
 # frame per `env.step()` call regardless of the underlying sim dt / `--step_hz`, so these are
@@ -147,7 +154,17 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
                 robot.write_joint_state_to_sim(position=blended, velocity=torch.zeros_like(blended))
 
     def get_action(self, env) -> torch.Tensor:
-        """Compute the action tensor for the current step (8D IK pose target)."""
+        """Compute the action tensor for the current step (8D IK pose target).
+
+        Cube/target positions below describe where the *jaw* (fingertip contact point, see
+        ``ee_frame``'s second target frame) should be -- not the raw "gripper" IK control frame,
+        which sits at a fixed but non-trivial offset from the jaw. That offset is read live from
+        the ``ee_frame`` sensor (constant here since the commanded gripper orientation never
+        changes) and subtracted from every jaw target to get the actual IK command. Using a
+        hard-coded gripper-frame offset instead (as tuned for the much larger orange in
+        ``pick_orange.py``) placed the gripper's IK point far from this small 3cm cube and the
+        jaw never closed around it.
+        """
         robot = env.scene["robot"]
         robot.write_joint_damping_to_sim(damping=10.0)
 
@@ -160,6 +177,9 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         circle_target_pos_w = env.scene["circle_target"].data.root_pos_w.clone()
         robot_base_pos_w = robot.data.root_pos_w.clone()
         robot_base_quat_w = robot.data.root_quat_w.clone()
+
+        ee_frame = env.scene["ee_frame"]
+        gripper_to_jaw = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
 
         target_quat_w = quat_from_euler_xyz(
             torch.tensor(0.0, device=device),
@@ -175,25 +195,25 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
 
         if step < _APPROACH_STEPS:
-            pos_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _LOWER_TO_CUBE_END:
-            pos_w, gripper_cmd = self._phase_lower_to_cube(cube_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_lower_to_cube(cube_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _GRASP_END:
-            pos_w, gripper_cmd = self._phase_grasp(cube_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_grasp(cube_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _LIFT_CUBE_END:
-            pos_w, gripper_cmd = self._phase_lift_cube(cube_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_lift_cube(cube_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _MOVE_TO_MIDDLE_END:
-            pos_w, gripper_cmd = self._phase_move_to_middle(cube_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_move_to_middle(cube_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _HOLD_MIDDLE_END:
-            pos_w, gripper_cmd = self._phase_hold_middle(num_envs, device)
+            pos_w, gripper_cmd = self._phase_hold_middle(gripper_to_jaw, num_envs, device)
         elif step < _MOVE_ABOVE_TARGET_END:
-            pos_w, gripper_cmd = self._phase_move_above_target(selected_target_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_move_above_target(selected_target_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _LOWER_TO_TARGET_END:
-            pos_w, gripper_cmd = self._phase_lower_to_target(selected_target_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_lower_to_target(selected_target_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _RELEASE_END:
-            pos_w, gripper_cmd = self._phase_release(selected_target_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_release(selected_target_pos_w, gripper_to_jaw, num_envs, device)
         elif step < _LIFT_GRIPPER_END:
-            pos_w, gripper_cmd = self._phase_lift_gripper(selected_target_pos_w, num_envs, device)
+            pos_w, gripper_cmd = self._phase_lift_gripper(selected_target_pos_w, gripper_to_jaw, num_envs, device)
         else:
             pos_w, gripper_cmd = self._phase_return_home(num_envs, device)
 
@@ -217,64 +237,68 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
     # ------------------------------------------------------------------
     # Phase methods
+    #
+    # Each phase (other than the final return-home) computes a *jaw* target position; the
+    # `gripper_to_jaw` (world-frame) offset passed in is subtracted to get the actual IK
+    # ("gripper" frame) target sent to the arm.
     # ------------------------------------------------------------------
 
-    def _phase_approach_hover(self, cube_pos_w, num_envs, device):
-        hover_target = cube_pos_w.clone()
-        hover_target[:, 2] += _GRIPPER_OFFSET + 0.10
+    def _phase_approach_hover(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+        hover_jaw = cube_pos_w.clone()
+        hover_jaw[:, 2] += _HOVER_CLEARANCE
+        hover_gripper_target = hover_jaw - gripper_to_jaw
         alpha = self._step_count / _APPROACH_STEPS
         if self._initial_ee_pos is not None:
-            pos_w = (1.0 - alpha) * self._initial_ee_pos + alpha * hover_target
+            pos_w = (1.0 - alpha) * self._initial_ee_pos + alpha * hover_gripper_target
         else:
-            pos_w = hover_target
+            pos_w = hover_gripper_target
         return pos_w, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
-    def _phase_lower_to_cube(self, cube_pos_w, num_envs, device):
-        pos_w = cube_pos_w.clone()
-        pos_w[:, 2] += _GRIPPER_OFFSET
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+    def _phase_lower_to_cube(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+        jaw_target = cube_pos_w.clone()  # jaw at the cube's center
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
-    def _phase_grasp(self, cube_pos_w, num_envs, device):
-        pos_w = cube_pos_w.clone()
-        pos_w[:, 2] += _GRIPPER_OFFSET
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+    def _phase_grasp(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+        jaw_target = cube_pos_w.clone()
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_lift_cube(self, cube_pos_w, num_envs, device):
-        pos_w = cube_pos_w.clone()
-        pos_w[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+    def _phase_lift_cube(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+        jaw_target = cube_pos_w.clone()
+        jaw_target[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_move_to_middle(self, cube_pos_w, num_envs, device):
-        lift_pos = cube_pos_w.clone()
-        lift_pos[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
+    def _phase_move_to_middle(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+        lift_jaw = cube_pos_w.clone()
+        lift_jaw[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
         alpha = (self._step_count - _LIFT_CUBE_END) / float(_MOVE_TO_MIDDLE_END - _LIFT_CUBE_END)
-        pos_w = (1.0 - alpha) * lift_pos + alpha * self._hold_pos_world
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        jaw_target = (1.0 - alpha) * lift_jaw + alpha * self._hold_pos_world
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_hold_middle(self, num_envs, device):
-        return self._hold_pos_world.clone(), torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+    def _phase_hold_middle(self, gripper_to_jaw, num_envs, device):
+        jaw_target = self._hold_pos_world.clone()
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_move_above_target(self, selected_target_pos_w, num_envs, device):
+    def _phase_move_above_target(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
         target_hover = selected_target_pos_w.clone()
         target_hover[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
         alpha = (self._step_count - _HOLD_MIDDLE_END) / float(_MOVE_ABOVE_TARGET_END - _HOLD_MIDDLE_END)
-        pos_w = (1.0 - alpha) * self._hold_pos_world + alpha * target_hover
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        jaw_target = (1.0 - alpha) * self._hold_pos_world + alpha * target_hover
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_lower_to_target(self, selected_target_pos_w, num_envs, device):
-        pos_w = selected_target_pos_w.clone()
-        pos_w[:, 2] += _GRIPPER_OFFSET
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+    def _phase_lower_to_target(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
+        jaw_target = selected_target_pos_w.clone()
+        jaw_target[:, 2] += _RELEASE_CLEARANCE
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_release(self, selected_target_pos_w, num_envs, device):
-        pos_w = selected_target_pos_w.clone()
-        pos_w[:, 2] += _GRIPPER_OFFSET
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+    def _phase_release(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
+        jaw_target = selected_target_pos_w.clone()
+        jaw_target[:, 2] += _RELEASE_CLEARANCE
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
-    def _phase_lift_gripper(self, selected_target_pos_w, num_envs, device):
-        pos_w = selected_target_pos_w.clone()
-        pos_w[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+    def _phase_lift_gripper(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
+        jaw_target = selected_target_pos_w.clone()
+        jaw_target[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
+        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
     def _phase_return_home(self, num_envs, device):
         if self._rest_ee_pos_world is not None:
