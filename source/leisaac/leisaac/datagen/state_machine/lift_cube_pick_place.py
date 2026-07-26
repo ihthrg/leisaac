@@ -62,6 +62,23 @@ _RELEASE_END = 760  # +40 (0.67s)
 _LIFT_GRIPPER_END = 800  # +40 (0.67s)
 _TOTAL_STEPS = 1100  # +300 (5.0s): return home, ends the episode
 
+# DEBUG: (step, phase-name) pairs used by the diagnostic print in get_action() to report which
+# phase is starting and the key positions involved -- remove once the grasp/pose issues are
+# resolved and confirmed fixed in sim.
+_PHASE_START_NAMES = (
+    (0, "approach_hover"),
+    (_APPROACH_STEPS, "lower_to_cube"),
+    (_LOWER_TO_CUBE_END, "grasp"),
+    (_GRASP_END, "lift_cube"),
+    (_LIFT_CUBE_END, "move_to_middle"),
+    (_MOVE_TO_MIDDLE_END, "hold_middle"),
+    (_HOLD_MIDDLE_END, "move_above_target"),
+    (_MOVE_ABOVE_TARGET_END, "lower_to_target"),
+    (_LOWER_TO_TARGET_END, "release"),
+    (_RELEASE_END, "lift_gripper"),
+    (_LIFT_GRIPPER_END, "return_home"),
+)
+
 
 def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
     """Check whether every joint is within ``_REST_POSE_TOLERANCE_DEG`` of ``_REST_POSE_DEG``."""
@@ -144,7 +161,12 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         )
         env.sim.step(render=False)
         env.scene.update(dt=env.physics_dt)
-        self._rest_ee_pos_world = robot.data.body_pos_w[:, -1, :].clone()
+        # Use the ee_frame's "gripper" target (index 0, no offset) rather than
+        # `robot.data.body_pos_w[:, -1, :]` -- the latter is whatever body happens to be *last*
+        # in the articulation's body list, which is not guaranteed to be "gripper" if e.g. "jaw"
+        # is a separate body ordered after it. This keeps every EE-space position in this file
+        # anchored to the exact same, explicitly-named prim that the IK action also targets.
+        self._rest_ee_pos_world = env.scene["ee_frame"].data.target_pos_w[:, 0, :].clone()
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
@@ -245,10 +267,22 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
 
         if step == 0:
-            self._initial_ee_pos = robot.data.body_pos_w[:, -1, :].clone()
+            self._initial_ee_pos = ee_frame.data.target_pos_w[:, 0, :].clone()
             self._target_is_circle = cube_pos_w[:, 0] > self._center_x
 
         selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
+
+        # DEBUG: report which phase is starting and the key positions involved (env 0 only) --
+        # remove once the grasp/pose issues are resolved and confirmed fixed in sim.
+        for boundary_step, phase_name in _PHASE_START_NAMES:
+            if step == boundary_step:
+                print(
+                    f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
+                    f"cube_pos={cube_pos_w[0].tolist()} gripper_to_jaw={gripper_to_jaw[0].tolist()} "
+                    f"hold_pos_world={self._hold_pos_world[0].tolist() if self._hold_pos_world is not None else None} "
+                    f"rest_ee_pos_world={self._rest_ee_pos_world[0].tolist() if self._rest_ee_pos_world is not None else None}"
+                )
+                break
 
         if step < _APPROACH_STEPS:
             pos_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, gripper_to_jaw, num_envs, device)
