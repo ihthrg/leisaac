@@ -35,17 +35,23 @@ U20CAM_HEIGHT = 480
 # `fisheye_nominal_focal_length` / `fisheye_model` API.
 u20cam_spawn_cfg = sim_utils.FisheyeCameraCfg(
     projection_type="fisheyePolynomial",
-    focal_length=3.2,
+    focal_length=2.8,             # レンズ焦点距離 2.8 mm
     focus_distance=400.0,
-    # horizontal_aperture=38.11,
-    horizontal_aperture=38.11,
+    horizontal_aperture=4.8,      # 1/3" センサー幅（cm）
+    vertical_aperture=2.7,        # 1/3" センサー高さ（cm）
     clipping_range=(0.01, 50.0),
     lock_camera=True,
-    fisheye_nominal_width=U20CAM_WIDTH,
-    fisheye_nominal_height=U20CAM_HEIGHT,
-    fisheye_optical_centre_x=U20CAM_WIDTH / 2.0,
-    fisheye_optical_centre_y=U20CAM_HEIGHT / 2.0,
-    fisheye_max_fov=120.0,
+    fisheye_nominal_width=1920.0,   # 実機の最大解像度（内部モデル用）
+    fisheye_nominal_height=1080.0,
+    fisheye_optical_centre_x=1920.0 / 2.0,
+    fisheye_optical_centre_y=1080.0 / 2.0,
+    fisheye_max_fov=130.0,          # 対角 FOV 130°
+    fisheye_polynomial_a=0.0,
+    fisheye_polynomial_b=0.000512913511431,
+    fisheye_polynomial_c=0.000000469430916431,
+    fisheye_polynomial_d=0.0,
+    fisheye_polynomial_e=0.0,
+    fisheye_polynomial_f=0.0,
 )
 
 
