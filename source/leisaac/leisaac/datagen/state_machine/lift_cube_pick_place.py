@@ -34,6 +34,11 @@ _MIDDLE_POSE_DEG = {
 }
 """Middle joint pose: all joints at 0 deg except a 90 deg counter-clockwise wrist roll."""
 
+_GRASP_APPROACH_DIR_WORLD = (0.0, 0.0, -1.0)
+"""World direction the gripper-to-jaw axis must point while grasping and placing. Pointing it
+straight down makes the arm reach over the cube and close on it from above; these phases
+previously reused the middle pose's orientation, which approached the cube from the side."""
+
 _REST_POSE_TOLERANCE_DEG = 30.0
 """Per-joint +/- tolerance (deg) used by ``_is_at_rest`` to decide if the arm reached
 ``_REST_POSE_DEG``. Matches the tolerance used by the shared
@@ -45,8 +50,7 @@ tolerance used by other tasks."""
 _HOLD_HEIGHT_ABOVE_TABLE = 0.20
 """Height (m) above the cube while lifting/carrying/holding it, expressed as a target for the
 *jaw* (see below), not the raw IK control frame. The "middle position" hold target itself is
-captured from the episode's natural post-reset state (see ``pre_step()``), not from this
-constant."""
+FK-calibrated in ``setup()``, not derived from this constant."""
 
 _HOVER_CLEARANCE = 0.10
 """Jaw height (m) above the cube when hovering, before/after lowering to grasp."""
@@ -95,6 +99,34 @@ def _quat_nlerp(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.T
     return interpolated / torch.linalg.vector_norm(interpolated, dim=-1, keepdim=True).clamp_min(1.0e-8)
 
 
+def _quat_between_vectors(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Shortest-arc quaternion rotating ``source`` onto ``target`` (both ``(N, 3)`` world vectors)."""
+    source = source / torch.linalg.vector_norm(source, dim=-1, keepdim=True).clamp_min(1.0e-8)
+    target = target / torch.linalg.vector_norm(target, dim=-1, keepdim=True).clamp_min(1.0e-8)
+
+    cos_angle = torch.sum(source * target, dim=-1, keepdim=True)
+    quat = torch.cat([1.0 + cos_angle, torch.cross(source, target, dim=-1)], dim=-1)
+
+    # Exactly antiparallel vectors have no unique shortest arc; any perpendicular axis gives the
+    # required 180 deg rotation, so pick whichever reference axis is not parallel to ``source``.
+    primary_ref = torch.zeros_like(source)
+    primary_ref[..., 0] = 1.0
+    secondary_ref = torch.zeros_like(source)
+    secondary_ref[..., 1] = 1.0
+    perpendicular = torch.cross(source, primary_ref, dim=-1)
+    perpendicular = torch.where(
+        torch.linalg.vector_norm(perpendicular, dim=-1, keepdim=True) < 1.0e-6,
+        torch.cross(source, secondary_ref, dim=-1),
+        perpendicular,
+    )
+    quat = torch.where(
+        cos_angle < -1.0 + 1.0e-6,
+        torch.cat([torch.zeros_like(cos_angle), perpendicular], dim=-1),
+        quat,
+    )
+    return quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-8)
+
+
 def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
     """Check whether every joint is within ``_REST_POSE_TOLERANCE_DEG`` of ``_REST_POSE_DEG``."""
     is_rest = torch.ones(joint_pos.shape[0], dtype=torch.bool, device=joint_pos.device)
@@ -137,6 +169,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._home_start_pos: torch.Tensor | None = None
         self._hold_pos_world: torch.Tensor | None = None
         self._hold_quat_world: torch.Tensor | None = None
+        self._grasp_quat_world: torch.Tensor | None = None
         self._center_x: float = 0.0
         self._target_is_circle: torch.Tensor | None = None
 
@@ -199,6 +232,16 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         env.scene.update(dt=env.physics_dt)
         self._hold_pos_world = ee_frame.data.target_pos_w[:, 1, :].clone()
         self._hold_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
+
+        # Top-down grasp orientation: rotate the middle orientation by the shortest arc that
+        # brings its gripper-to-jaw axis onto straight down, so the jaw closes on the cube from
+        # above while otherwise staying as close to the middle orientation as possible.
+        middle_approach_dir = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
+        down_dir = torch.tensor(_GRASP_APPROACH_DIR_WORLD, device=env.device).expand_as(middle_approach_dir)
+        self._grasp_quat_world = quat_mul(
+            _quat_between_vectors(middle_approach_dir, down_dir),
+            self._hold_quat_world,
+        )
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
@@ -263,11 +306,9 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         using the current world-space offset is only correct when current and target
         orientations already match.
 
-        The target orientation follows the robot's actual poses: the approach smoothly moves
-        from the rest-pose orientation to the configured initial/middle-pose orientation, task
-        phases keep that initial orientation, and return-home restores the rest orientation.
-        This avoids the previous instantaneous command to world identity at step 0, which made
-        the arm turn left before it even began approaching the cube.
+        The target orientation is scheduled per phase by ``_target_orientation()``: grasping and
+        placing use the top-down orientation, the mid-air hold uses the middle orientation, and
+        return-home restores the rest orientation, with smooth interpolation in between.
         """
         robot = env.scene["robot"]
         robot.write_joint_damping_to_sim(damping=10.0)
@@ -290,19 +331,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             self._initial_ee_quat_world = current_gripper_quat_w.clone()
             self._target_is_circle = cube_pos_w[:, 0] > self._center_x
 
-        if step < _APPROACH_STEPS and self._initial_ee_quat_world is not None and self._hold_quat_world is not None:
-            target_quat_w = _quat_nlerp(
-                self._initial_ee_quat_world,
-                self._hold_quat_world,
-                self._step_count / float(_APPROACH_STEPS),
-            )
-        elif step < _LIFT_GRIPPER_END and self._hold_quat_world is not None:
-            target_quat_w = self._hold_quat_world.clone()
-        elif self._rest_ee_quat_world is not None:
-            target_quat_w = self._rest_ee_quat_world.clone()
-        else:
-            target_quat_w = current_gripper_quat_w
-
+        target_quat_w = self._target_orientation(step, current_gripper_quat_w)
         target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
 
         gripper_to_jaw_world = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
@@ -366,6 +395,41 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._initial_ee_quat_world = None
         self._home_start_pos = None
         self._target_is_circle = None
+
+    # ------------------------------------------------------------------
+    # Orientation schedule
+    # ------------------------------------------------------------------
+
+    def _target_orientation(self, step: int, current_gripper_quat_w: torch.Tensor) -> torch.Tensor:
+        """Return the world-space gripper orientation commanded at ``step``.
+
+        Picking the cube up and releasing it onto a marker both use the top-down orientation, so
+        the jaw descends onto the object rather than reaching in sideways. Only the mid-air hold
+        uses the middle orientation, and the episode ends back at the rest orientation.
+        """
+        if self._grasp_quat_world is None or self._hold_quat_world is None:
+            return current_gripper_quat_w
+
+        if step < _APPROACH_STEPS:
+            start_quat = (
+                self._initial_ee_quat_world if self._initial_ee_quat_world is not None else current_gripper_quat_w
+            )
+            return _quat_nlerp(start_quat, self._grasp_quat_world, step / float(_APPROACH_STEPS))
+        if step < _LIFT_CUBE_END:
+            return self._grasp_quat_world.clone()
+        if step < _MOVE_TO_MIDDLE_END:
+            alpha = (step - _LIFT_CUBE_END) / float(_MOVE_TO_MIDDLE_END - _LIFT_CUBE_END)
+            return _quat_nlerp(self._grasp_quat_world, self._hold_quat_world, alpha)
+        if step < _HOLD_MIDDLE_END:
+            return self._hold_quat_world.clone()
+        if step < _MOVE_ABOVE_TARGET_END:
+            alpha = (step - _HOLD_MIDDLE_END) / float(_MOVE_ABOVE_TARGET_END - _HOLD_MIDDLE_END)
+            return _quat_nlerp(self._hold_quat_world, self._grasp_quat_world, alpha)
+        if step < _LIFT_GRIPPER_END:
+            return self._grasp_quat_world.clone()
+        if self._rest_ee_quat_world is not None:
+            return self._rest_ee_quat_world.clone()
+        return current_gripper_quat_w
 
     # ------------------------------------------------------------------
     # Phase methods
