@@ -25,25 +25,28 @@ _REST_POSE_DEG = {
 }
 
 _MIDDLE_POSE_DEG = {
-    "shoulder_pan": 0.0,  # motor ID 1
-    "shoulder_lift": 90.0,  # motor ID 2
-    "elbow_flex": 90.0,  # motor ID 3
-    "wrist_flex": 0.0,  # motor ID 4
-    "wrist_roll": 90.0,  # motor ID 5
-    "gripper": 0.0,  # motor ID 6 (overridden by the binary gripper command while holding)
+    "shoulder_pan": 0.0,  # J1: facing front (centered)
+    "shoulder_lift": 0.0,  # J2: upper arm horizontal
+    "elbow_flex": 90.0,  # J3: forearm bent ~90 deg
+    "wrist_flex": 0.0,  # J4: straight (centered)
+    "wrist_roll": 0.0,  # J5: straight (centered)
+    "gripper": 0.0,  # J6 (overridden by the binary gripper command while holding)
 }
 """Joint pose used as the in-air hold target ("middle position").
 
-This used to be the robot's ``init_state`` pose (all joints at 0 deg except ``wrist_roll``), but
-that configuration zeroes all three bending joints at once, so the arm ends up fully extended
-forward. A straight arm is a kinematic singularity, where the differential-IK solver used by this
-task loses a DoF and converges poorly, so it is a bad pose to command. Bending ``shoulder_lift``
-and ``elbow_flex`` to 90 deg keeps the cube in front of the camera while staying well away from
-that singularity.
+Requested reference pose: J1 front/centered, J2 horizontal, J3 bent ~90 deg, J4/J5 straight.
+
+``shoulder_lift`` is 0 deg because the all-zero configuration renders as an arm stretched
+straight out *in front of* the robot, i.e. the upper arm at 0 deg is already horizontal. Bending
+only ``elbow_flex`` therefore keeps the upper arm horizontal while lifting the forearm, and also
+moves the arm off the fully-extended configuration -- a kinematic singularity where the
+differential-IK solver used by this task loses a DoF and converges poorly.
 
 Note that ``elbow_flex`` at 90 deg sits exactly on its USD upper limit (see
 ``SO101_FOLLOWER_USD_JOINT_LIMLITS``), which is also what ``_REST_POSE_DEG`` uses, so the IK
-solver cannot overshoot in that direction while tracking this pose."""
+solver cannot overshoot in that direction while tracking this pose. If the forearm turns out to
+bend toward the table rather than away from it, flip this to -90 deg (the lower limit is -100,
+so the opposite sign is also reachable)."""
 
 _GRASP_APPROACH_DIR_WORLD = (0.0, 0.0, -1.0)
 """World direction the gripper-to-jaw axis must point while grasping and placing. Pointing it
@@ -246,10 +249,10 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         # Reference heading for `_top_down_quat`: the horizontal direction the arm reaches when
         # `shoulder_pan` is 0. Measured with a dedicated FK probe at the all-zero joint pose (a
-        # fully extended arm) instead of reusing the hold pose, because the hold pose is folded
-        # back toward the base, where the base-to-jaw azimuth is ill-conditioned and can even be
-        # flipped by 180 deg. The extended arm puts the jaw unambiguously far out in front, so
-        # its azimuth is a reliable stand-in for "shoulder_pan == 0".
+        # fully extended arm) instead of reusing the hold pose, so the reference stays valid
+        # whatever `_MIDDLE_POSE_DEG` is set to: a folded hold pose can put the jaw close to the
+        # base, where the base-to-jaw azimuth is ill-conditioned and can even flip by 180 deg.
+        # The extended arm puts the jaw unambiguously far out in front.
         zero_joint_pos = torch.zeros_like(self._rest_joint_pos)
         robot.write_joint_state_to_sim(
             position=zero_joint_pos,
