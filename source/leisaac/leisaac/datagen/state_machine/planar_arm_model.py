@@ -63,11 +63,25 @@ def _project_to_plane(point, pan_axis, plane_dir):
     return (rel_x * plane_dir[0] + rel_y * plane_dir[1], point[2])
 
 
-def _rotation_sign(center, point_zero, point_plus, delta_rad):
-    """Signed joint->rotation gain, read off a +-delta probe pair. Rounded to the nearest +-1."""
-    gain = wrap_to_pi(_angle_about(center, point_plus) - _angle_about(center, point_zero)) / delta_rad
+def _rotation_sign(center, point_zero, point_plus, joint_delta, joint_name):
+    """Signed joint->rotation gain, read off a probe pair. Rounded to the nearest +-1.
+
+    ``joint_delta`` is the joint displacement the arm *achieved* between the two probes, not the
+    one that was asked for, so a probe pose the arm failed to hold exactly still calibrates
+    correctly.
+    """
+    if abs(joint_delta) < 1.0e-3:
+        raise RuntimeError(
+            f"planar-arm calibration: '{joint_name}' barely moved between probes "
+            f"({math.degrees(joint_delta):.2f} deg) -- the arm is not reaching the probe poses."
+        )
+    gain = wrap_to_pi(_angle_about(center, point_plus) - _angle_about(center, point_zero)) / joint_delta
     if abs(abs(gain) - 1.0) > 0.15:
-        raise RuntimeError(f"planar-arm calibration: expected a unit joint gain, measured {gain:.3f}")
+        raise RuntimeError(
+            f"planar-arm calibration: '{joint_name}' should swing the jaw one-for-one about its own "
+            f"axis, but the measured gain is {gain:.3f}. Either the arm moves while the jaw is being "
+            "read, or the joint is running into a limit."
+        )
     return math.copysign(1.0, gain)
 
 
@@ -100,6 +114,7 @@ class PlanarArmModel:
         lengths: tuple[float, float, float],
         pitch_offsets: tuple[float, float, float],
         pitch_signs: tuple[float, float, float],
+        pan_zero: float = 0.0,
     ) -> None:
         self.pan_axis = pan_axis
         self.pan_sign = pan_sign
@@ -109,6 +124,8 @@ class PlanarArmModel:
         self.lengths = lengths
         self.pitch_offsets = pitch_offsets
         self.pitch_signs = pitch_signs
+        self.pan_zero = pan_zero
+        """``shoulder_pan`` angle the arm plane was measured at; solutions are offset from it."""
 
     # ------------------------------------------------------------------
     # Forward direction
@@ -215,7 +232,7 @@ class PlanarArmModel:
         forward = torch.sqrt(torch.clamp(radius_sq - self.plane_offset**2, min=1.0e-6))
         lateral = torch.full_like(forward, self.plane_offset)
         pan = wrap_to_pi(torch.atan2(offset_y, offset_x) - math.atan2(dir_y, dir_x) - torch.atan2(lateral, forward))
-        pan = pan / self.pan_sign
+        pan = self.pan_zero + pan / self.pan_sign
 
         target_f = forward - shoulder_f
         target_h = height - shoulder_h
@@ -288,8 +305,11 @@ def calibrate_planar_arm(probe, delta_deg: float = 45.0) -> PlanarArmModel:
     """Measure a :class:`PlanarArmModel` from forward-kinematics probes.
 
     Args:
-        probe: Callable ``(pan_deg, lift_deg, elbow_deg, wrist_flex_deg) -> (x, y, z)`` returning
-            the jaw position in the robot base frame. The caller is responsible for holding
+        probe: Callable ``(pan_deg, lift_deg, elbow_deg, wrist_flex_deg)`` returning
+            ``((x, y, z), (pan, lift, elbow, wrist_flex))`` -- the jaw position in the robot base
+            frame, and the joint angles the arm *actually reached*, in radians. Working from the
+            achieved angles rather than the requested ones keeps the result exact even when the
+            arm cannot hold a probe pose perfectly. The caller is responsible for holding
             ``wrist_roll`` and the gripper at the values used during the episode -- both move the
             jaw, so calibrating at a different value silently biases every solution.
         delta_deg: Probe displacement. Large enough to keep the circle fits well conditioned,
@@ -298,26 +318,26 @@ def calibrate_planar_arm(probe, delta_deg: float = 45.0) -> PlanarArmModel:
     Returns:
         The calibrated model.
     """
-    delta = math.radians(delta_deg)
-
     # Each joint rotates everything downstream of it about its own axis, so sweeping one joint
     # sends the jaw around a circle centred on that joint. Three points fix each circle exactly.
-    at_zero = probe(0.0, 0.0, 0.0, 0.0)
-    pan_minus = probe(-delta_deg, 0.0, 0.0, 0.0)
-    pan_plus = probe(delta_deg, 0.0, 0.0, 0.0)
-    lift_minus = probe(0.0, -delta_deg, 0.0, 0.0)
-    lift_plus = probe(0.0, delta_deg, 0.0, 0.0)
-    elbow_minus = probe(0.0, 0.0, -delta_deg, 0.0)
-    elbow_plus = probe(0.0, 0.0, delta_deg, 0.0)
-    wrist_minus = probe(0.0, 0.0, 0.0, -delta_deg)
-    wrist_plus = probe(0.0, 0.0, 0.0, delta_deg)
+    at_zero, zero_joints = probe(0.0, 0.0, 0.0, 0.0)
+    pan_minus, _ = probe(-delta_deg, 0.0, 0.0, 0.0)
+    pan_plus, pan_plus_joints = probe(delta_deg, 0.0, 0.0, 0.0)
+    lift_minus, _ = probe(0.0, -delta_deg, 0.0, 0.0)
+    lift_plus, lift_plus_joints = probe(0.0, delta_deg, 0.0, 0.0)
+    elbow_minus, _ = probe(0.0, 0.0, -delta_deg, 0.0)
+    elbow_plus, elbow_plus_joints = probe(0.0, 0.0, delta_deg, 0.0)
+    wrist_minus, _ = probe(0.0, 0.0, 0.0, -delta_deg)
+    wrist_plus, wrist_plus_joints = probe(0.0, 0.0, 0.0, delta_deg)
 
     # 1. Pan axis: horizontal circle traced by the jaw as shoulder_pan sweeps.
     horizontal = {
         name: (point[0], point[1]) for name, point in (("zero", at_zero), ("minus", pan_minus), ("plus", pan_plus))
     }
     pan_axis = _circle_center(horizontal["minus"], horizontal["zero"], horizontal["plus"])
-    pan_sign = _rotation_sign(pan_axis, horizontal["zero"], horizontal["plus"], delta)
+    pan_sign = _rotation_sign(
+        pan_axis, horizontal["zero"], horizontal["plus"], pan_plus_joints[0] - zero_joints[0], "shoulder_pan"
+    )
 
     # 2. Arm plane: every pan=0 probe lies in one vertical plane, so their horizontal positions
     #    lie on a line. Take its direction from the widest-separated pair for conditioning.
@@ -347,19 +367,25 @@ def calibrate_planar_arm(probe, delta_deg: float = 45.0) -> PlanarArmModel:
     wrist = _circle_center(to_plane(wrist_minus), zero_p, to_plane(wrist_plus))
 
     pitch_signs = (
-        _rotation_sign(shoulder, zero_p, to_plane(lift_plus), delta),
-        _rotation_sign(elbow, zero_p, to_plane(elbow_plus), delta),
-        _rotation_sign(wrist, zero_p, to_plane(wrist_plus), delta),
+        _rotation_sign(shoulder, zero_p, to_plane(lift_plus), lift_plus_joints[1] - zero_joints[1], "shoulder_lift"),
+        _rotation_sign(elbow, zero_p, to_plane(elbow_plus), elbow_plus_joints[2] - zero_joints[2], "elbow_flex"),
+        _rotation_sign(wrist, zero_p, to_plane(wrist_plus), wrist_plus_joints[3] - zero_joints[3], "wrist_flex"),
     )
     lengths = (
         math.dist(elbow, shoulder),
         math.dist(wrist, elbow),
         math.dist(zero_p, wrist),
     )
+
+    # The link pitches above were measured at whatever joint angles the reference probe reached,
+    # which is not necessarily all-zero; subtract that configuration's contribution so the offsets
+    # mean "pitch at zero joints", as ``pitches_from_joints`` assumes.
+    sign1, sign2, sign3 = pitch_signs
+    _, ref_lift, ref_elbow, ref_wrist_flex = zero_joints
     pitch_offsets = (
-        _angle_about(shoulder, elbow),
-        _angle_about(elbow, wrist),
-        _angle_about(wrist, zero_p),
+        _angle_about(shoulder, elbow) - sign1 * ref_lift,
+        _angle_about(elbow, wrist) - sign1 * ref_lift - sign2 * ref_elbow,
+        _angle_about(wrist, zero_p) - sign1 * ref_lift - sign2 * ref_elbow - sign3 * ref_wrist_flex,
     )
 
     return PlanarArmModel(
@@ -371,4 +397,5 @@ def calibrate_planar_arm(probe, delta_deg: float = 45.0) -> PlanarArmModel:
         lengths=lengths,
         pitch_offsets=pitch_offsets,
         pitch_signs=pitch_signs,
+        pan_zero=zero_joints[0],
     )
