@@ -26,27 +26,31 @@ _REST_POSE_DEG = {
 
 _MIDDLE_POSE_DEG = {
     "shoulder_pan": 0.0,  # J1: facing front (centered)
-    "shoulder_lift": 0.0,  # J2: upper arm horizontal
-    "elbow_flex": 90.0,  # J3: forearm bent ~90 deg
-    "wrist_flex": 0.0,  # J4: straight (centered)
+    "shoulder_lift": 90.0,  # J2: upper arm raised to vertical
+    "elbow_flex": -90.0,  # J3: forearm back down to horizontal, pointing forward
+    "wrist_flex": 0.0,  # J4: gripper in line with the forearm
     "wrist_roll": 0.0,  # J5: straight (centered)
     "gripper": 0.0,  # J6 (overridden by the binary gripper command while holding)
 }
 """Joint pose used as the in-air hold target ("middle position").
 
-Requested reference pose: J1 front/centered, J2 horizontal, J3 bent ~90 deg, J4/J5 straight.
+Reproduces the requested reference posture: an L shape with the **upper arm vertical** and the
+**forearm horizontal, pointing forward**, gripper in line with the forearm.
 
-``shoulder_lift`` is 0 deg because the all-zero configuration renders as an arm stretched
-straight out *in front of* the robot, i.e. the upper arm at 0 deg is already horizontal. Bending
-only ``elbow_flex`` therefore keeps the upper arm horizontal while lifting the forearm, and also
-moves the arm off the fully-extended configuration -- a kinematic singularity where the
-differential-IK solver used by this task loses a DoF and converges poorly.
+The angles follow from the all-zero configuration being an arm stretched straight out in front of
+the robot, with positive ``shoulder_lift``/``elbow_flex`` both rotating their link upward:
 
-Note that ``elbow_flex`` at 90 deg sits exactly on its USD upper limit (see
-``SO101_FOLLOWER_USD_JOINT_LIMLITS``), which is also what ``_REST_POSE_DEG`` uses, so the IK
-solver cannot overshoot in that direction while tracking this pose. If the forearm turns out to
-bend toward the table rather than away from it, flip this to -90 deg (the lower limit is -100,
-so the opposite sign is also reachable)."""
+* ``shoulder_lift`` +90 raises the upper arm from horizontal-forward to vertical.
+* ``elbow_flex`` -90 brings the forearm back down to horizontal, so its absolute pitch is
+  ``shoulder_lift + elbow_flex`` = 0.
+
+The same model reproduces ``_REST_POSE_DEG``: at ``shoulder_lift`` -100 / ``elbow_flex`` +90 the
+forearm sits at -10 deg, i.e. nearly horizontal just above the table, which is the compact folded
+rest posture. If the arm comes out mirrored in sim, negate both angles together -- their sum must
+stay at 0 to keep the forearm horizontal.
+
+Being bent also keeps the pose well away from the fully-extended configuration, a kinematic
+singularity where the differential-IK solver used by this task loses a DoF and converges poorly."""
 
 _GRASP_APPROACH_DIR_WORLD = (0.0, 0.0, -1.0)
 """World direction the gripper-to-jaw axis must point while grasping and placing. Pointing it
@@ -95,21 +99,37 @@ _HOVER_CLEARANCE = 0.10
 _RELEASE_CLEARANCE = 0.02
 """Jaw height (m) above the target marker when lowering to release the cube."""
 
+_GRASP_DEPTH_BELOW_CENTER = 0.01
+"""How far (m) *below* the cube's centre the jaw is commanded while descending and grasping.
+
+The damped-least-squares IK converges asymptotically and is additionally over-constrained here
+(5 joints tracking a 6-DoF pose), so the jaw always stops slightly short of its commanded target.
+Aiming for the exact centre therefore leaves the fingers hovering just above the cube and closing
+on air. Over-commanding along the approach direction absorbs that residual.
+
+The cube is 3 cm, so its centre is 1.5 cm above the table: at 1 cm this target still sits inside
+the cube, and even if the IK converged perfectly the fingers would straddle the lower half of the
+cube rather than pushing into the table."""
+
 # Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim
 # tick, so a 60Hz simulation (`--step_hz 60`) requires `round(seconds * 60)` steps for the
 # intended physical duration. `LeRobotRecorderManager` separately downsamples those steps to the
 # requested dataset rate (`--lerobot_dataset_fps 30`, i.e. every second step here).
-_APPROACH_STEPS = 120  # phase ends at 120 (2.0s): interpolate from initial EE pos to cube hover
-_LOWER_TO_CUBE_END = 180  # +60 (1.0s)
-_GRASP_END = 240  # +60 (1.0s)
-_LIFT_CUBE_END = 300  # +60 (1.0s)
-_MOVE_TO_MIDDLE_END = 390  # +90 (1.5s)
-_HOLD_MIDDLE_END = 570  # +180 (3.0s) <- user requirement: hold ~3s near the "middle position"
-_MOVE_ABOVE_TARGET_END = 660  # +90 (1.5s)
-_LOWER_TO_TARGET_END = 720  # +60 (1.0s)
-_RELEASE_END = 760  # +40 (0.67s)
-_LIFT_GRIPPER_END = 800  # +40 (0.67s)
-_TOTAL_STEPS = 1100  # +300 (5.0s): return home, ends the episode
+# The three phases up to and including the grasp are deliberately generous: the differential-IK
+# solver is over-constrained here (5 joints tracking a 6-DoF pose), so it approaches its target
+# asymptotically rather than reaching it exactly, and cutting a phase short leaves the jaw short
+# of the cube and closing on air.
+_APPROACH_STEPS = 180  # phase ends at 180 (3.0s): interpolate from initial EE pos to cube hover
+_LOWER_TO_CUBE_END = 300  # +120 (2.0s): descend onto the cube and let the IK error settle
+_GRASP_END = 390  # +90 (1.5s): hold still while the gripper actually closes
+_LIFT_CUBE_END = 450  # +60 (1.0s)
+_MOVE_TO_MIDDLE_END = 540  # +90 (1.5s)
+_HOLD_MIDDLE_END = 720  # +180 (3.0s) <- user requirement: hold ~3s near the "middle position"
+_MOVE_ABOVE_TARGET_END = 810  # +90 (1.5s)
+_LOWER_TO_TARGET_END = 870  # +60 (1.0s)
+_RELEASE_END = 930  # +60 (1.0s)
+_LIFT_GRIPPER_END = 990  # +60 (1.0s)
+_TOTAL_STEPS = 1290  # +300 (5.0s): return home, ends the episode
 
 # DEBUG: (step, phase-name) pairs used by the diagnostic print in get_action() to report which
 # phase is starting and the key positions involved -- remove once the grasp/pose issues are
@@ -416,9 +436,11 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         # remove once the grasp/pose issues are resolved and confirmed fixed in sim.
         for boundary_step, phase_name in _PHASE_START_NAMES:
             if step == boundary_step:
+                jaw_pos = ee_frame.data.target_pos_w[0, 1, :]
                 print(
                     f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
-                    f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={ee_frame.data.target_pos_w[0, 1, :].tolist()} "
+                    f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={jaw_pos.tolist()} "
+                    f"jaw_minus_cube={(jaw_pos - cube_pos_w[0]).tolist()} "
                     f"gripper_to_jaw={gripper_to_jaw[0].tolist()} "
                     f"current_quat_w={current_gripper_quat_w[0].tolist()} "
                     f"target_quat_w={target_quat_w[0].tolist()} "
@@ -549,11 +571,13 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         return pos_w, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
     def _phase_lower_to_cube(self, cube_pos_w, gripper_to_jaw, num_envs, device):
-        jaw_target = cube_pos_w.clone()  # jaw at the cube's center
+        jaw_target = cube_pos_w.clone()
+        jaw_target[:, 2] -= _GRASP_DEPTH_BELOW_CENTER
         return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
     def _phase_grasp(self, cube_pos_w, gripper_to_jaw, num_envs, device):
         jaw_target = cube_pos_w.clone()
+        jaw_target[:, 2] -= _GRASP_DEPTH_BELOW_CENTER
         return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
     def _phase_lift_cube(self, cube_pos_w, gripper_to_jaw, num_envs, device):
