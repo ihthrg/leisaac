@@ -25,14 +25,25 @@ _REST_POSE_DEG = {
 }
 
 _MIDDLE_POSE_DEG = {
-    "shoulder_pan": 0.0,
-    "shoulder_lift": 0.0,
-    "elbow_flex": 0.0,
-    "wrist_flex": 0.0,
-    "wrist_roll": 90.0,
-    "gripper": 0.0,
+    "shoulder_pan": 0.0,  # motor ID 1
+    "shoulder_lift": 90.0,  # motor ID 2
+    "elbow_flex": 90.0,  # motor ID 3
+    "wrist_flex": 0.0,  # motor ID 4
+    "wrist_roll": 90.0,  # motor ID 5
+    "gripper": 0.0,  # motor ID 6 (overridden by the binary gripper command while holding)
 }
-"""Middle joint pose: all joints at 0 deg except a 90 deg counter-clockwise wrist roll."""
+"""Joint pose used as the in-air hold target ("middle position").
+
+This used to be the robot's ``init_state`` pose (all joints at 0 deg except ``wrist_roll``), but
+that configuration zeroes all three bending joints at once, so the arm ends up fully extended
+forward. A straight arm is a kinematic singularity, where the differential-IK solver used by this
+task loses a DoF and converges poorly, so it is a bad pose to command. Bending ``shoulder_lift``
+and ``elbow_flex`` to 90 deg keeps the cube in front of the camera while staying well away from
+that singularity.
+
+Note that ``elbow_flex`` at 90 deg sits exactly on its USD upper limit (see
+``SO101_FOLLOWER_USD_JOINT_LIMLITS``), which is also what ``_REST_POSE_DEG`` uses, so the IK
+solver cannot overshoot in that direction while tracking this pose."""
 
 _GRASP_APPROACH_DIR_WORLD = (0.0, 0.0, -1.0)
 """World direction the gripper-to-jaw axis must point while grasping and placing. Pointing it
@@ -159,9 +170,8 @@ def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor
 class LiftCubePickPlaceStateMachine(StateMachineBase):
     """State machine for the conditional lift-cube pick-and-place (sort) task.
 
-    Picks up the cube, holds it for ~3 seconds at the SO-101 "middle position" (all joints at
-    0 deg except a 90 deg counter-clockwise wrist roll), then places it on whichever target
-    matches its original spawn side:
+    Picks up the cube, holds it for ~3 seconds at the SO-101 "middle position" (see
+    ``_MIDDLE_POSE_DEG``), then places it on whichever target matches its original spawn side:
     the circle target if the cube spawned to the right (+X) of the nominal center, or the
     square target if it spawned to the left. Finally returns the arm to the SO-101 rest pose.
 
@@ -194,14 +204,15 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     def setup(self, env) -> None:
         """FK calibration for the rest and middle poses; other one-time setup.
 
-        Teleports the joints first to the SO-101 rest pose and then to the requested middle
-        pose (all joints at 0 deg except ``wrist_roll`` at +90 deg), reading the corresponding
-        world-space gripper/jaw poses via FK. These are used as ordinary IK targets during the
-        episode, so the arm reaches them through smooth, physically-simulated motion rather
-        than teleporting while carrying the cube.
+        Teleports the joints to the SO-101 rest pose, then to the all-zero pose, then to the
+        requested middle pose (see ``_MIDDLE_POSE_DEG``), reading the corresponding world-space
+        gripper/jaw poses via FK. These are used as ordinary IK targets during the episode, so
+        the arm reaches them through smooth, physically-simulated motion rather than teleporting
+        while carrying the cube. The all-zero probe is only used to measure the arm's reach
+        heading (see ``_grasp_azimuth_ref`` below); it is never commanded.
 
-        The caller resets the environment after ``setup()``, so neither calibration pose leaks
-        into the first recorded episode.
+        The caller resets the environment after ``setup()``, so none of these calibration poses
+        leak into the first recorded episode.
 
         ``center_x`` (the left/right decision threshold) is derived from the cube's *nominal*
         (pre-randomization) spawn point, i.e. ``env.cfg.scene.cube.init_state.pos`` -- the same
@@ -233,6 +244,21 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._rest_ee_pos_world = ee_frame.data.target_pos_w[:, 0, :].clone()
         self._rest_ee_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
 
+        # Reference heading for `_top_down_quat`: the horizontal direction the arm reaches when
+        # `shoulder_pan` is 0. Measured with a dedicated FK probe at the all-zero joint pose (a
+        # fully extended arm) instead of reusing the hold pose, because the hold pose is folded
+        # back toward the base, where the base-to-jaw azimuth is ill-conditioned and can even be
+        # flipped by 180 deg. The extended arm puts the jaw unambiguously far out in front, so
+        # its azimuth is a reliable stand-in for "shoulder_pan == 0".
+        zero_joint_pos = torch.zeros_like(self._rest_joint_pos)
+        robot.write_joint_state_to_sim(
+            position=zero_joint_pos,
+            velocity=torch.zeros_like(zero_joint_pos),
+        )
+        env.sim.step(render=False)
+        env.scene.update(dt=env.physics_dt)
+        self._grasp_azimuth_ref = _azimuth(ee_frame.data.target_pos_w[:, 1, :], robot.data.root_pos_w)
+
         middle_joint_pos = torch.zeros_like(self._rest_joint_pos)
         for idx, name in enumerate(joint_names):
             if name in _MIDDLE_POSE_DEG:
@@ -256,10 +282,6 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             _quat_between_vectors(middle_approach_dir, down_dir),
             self._hold_quat_world,
         )
-        # Heading of the middle pose's jaw around the robot base. ``_top_down_quat`` re-yaws the
-        # orientation above relative to this reference, so the commanded pose stays inside the
-        # vertical plane that ``shoulder_pan`` actually swings the arm through.
-        self._grasp_azimuth_ref = _azimuth(self._hold_pos_world, robot.data.root_pos_w)
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
