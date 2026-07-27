@@ -1,168 +1,115 @@
 """State machine for the conditional lift-cube pick-and-place (sort) task."""
 
+import math
+
 import torch
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply, quat_inv, quat_mul
+from isaaclab.utils.math import quat_apply, quat_inv
+from leisaac.assets.robots.lerobot import SO101_FOLLOWER_USD_JOINT_LIMLITS
 from leisaac.tasks.lift_cube.mdp import cube_placed_on_correct_target
 
 from .base import StateMachineBase
+from .planar_arm_model import calibrate_planar_arm, wrap_to_pi
 
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 
-_GRIPPER_OPEN = 1.0
-_GRIPPER_CLOSE = -1.0
+_ARM_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+
+_GRIPPER_OPEN_RAD = 1.0
+_GRIPPER_CLOSE_RAD = 0.01
+"""Gripper joint targets (rad). The closed value must stay below the ``0.26`` rad threshold that
+``mdp.object_grasped``/``cube_placed_on_correct_target`` use to tell a closed gripper from an open
+one, and the open value above it."""
+
+_WRIST_ROLL_DEG = 90.0
+"""``wrist_roll`` is held here for the whole episode.
+
+With the gripper pointing straight down this joint only spins the fingers about the vertical
+approach axis, so the cube can be grasped at any value; keeping it constant means the joint never
+has to unwind mid-episode, and it matches the requested rest and hold postures."""
 
 _REST_POSE_DEG = {
     "shoulder_pan": 0.0,
     "shoulder_lift": -100.0,
     "elbow_flex": 90.0,
     "wrist_flex": 50.0,
-    "wrist_roll": 90.0,  # counter-clockwise 90 deg (was 0.0); flip the sign if this turns out
-    # to be clockwise instead once verified in sim.
+    "wrist_roll": _WRIST_ROLL_DEG,
     "gripper": -10.0,
 }
 
-_MIDDLE_POSE_DEG = {
-    "shoulder_pan": 0.0,  # J1: facing front (centered)
-    "shoulder_lift": -16.4,  # J2: upper arm vertical
-    "elbow_flex": 15.7,  # J3: forearm horizontal, pointing forward
-    "wrist_flex": 0.0,  # J4: gripper in line with the forearm
-    "wrist_roll": 0.0,  # J5: straight (centered)
-    "gripper": 0.0,  # J6 (overridden by the binary gripper command while holding)
-}
-"""Joint pose used as the in-air hold target ("middle position").
+_HOLD_LINK_PITCHES_DEG = (90.0, 0.0, 0.0)
+"""In-air hold posture ("middle position"), given as the absolute pitch of each arm link.
 
-Reproduces the requested reference posture: an L shape with the **upper arm vertical** and the
-**forearm horizontal, pointing forward**.
+This states the requested shape directly: the segment leaving joint ID2 (the upper arm) is
+**vertical** (+90 deg) and everything from joint ID3 outwards -- the forearm *and* the gripper --
+is **horizontal** (0 deg). The joint angles are solved from these three pitches at start-up by
+``PlanarArmModel.joints_for_link_pitches``, against kinematics measured on the actual robot.
 
-These angles are not guessed -- they are solved from the arm's real kinematics. Five
-(``shoulder_lift``, ``elbow_flex``) pairs were FK-probed in sim and their jaw positions fitted to
-a planar two-link model, which reproduced all five to 3.2 mm RMS and recovered ``L1 = 0.1159 m``,
-matching the SO-101's actual upper-arm length. In that model the link pitches (measured from
-horizontal-forward, positive up) are::
+Stating the posture as link pitches rather than joint angles is what makes it correct. Every pitch
+joint carries through to the links beyond it, so the same ``elbow_flex`` value means a different
+forearm pitch at every ``shoulder_lift``; and ``wrist_flex = 0`` leaves the gripper parallel to the
+forearm only if those two links happen to share a zero offset, which on this arm they do not.
+Earlier revisions fixed joint angles by hand and produced an arm that looked stretched out because
+the links did not end up at the intended pitches."""
 
-    upper arm = 73.6 - shoulder_lift
-    forearm   = upper arm + 285.7 - elbow_flex
+_CALIB_DELTA_DEG = 45.0
+"""Probe displacement used to measure the kinematics. Large enough for well-conditioned circle
+fits, small enough to stay inside every joint limit from the all-zero probe pose."""
 
-Setting the upper arm to +90 deg and the forearm to 0 deg gives the angles above. The model also
-explains why the two poses tried before both looked stretched out: measured as distance from the
-shoulder, with 0.406 m being full extension,
+_JOINT_DAMPING = 3.0
+"""Joint damping override (the asset default is 0.60, tuned for teleoperation).
 
-===========================  ==========  ===========  ============
-pose                         upper arm   forearm      distance
-===========================  ==========  ===========  ============
-all joints 0                 +73.6 deg   -0.7 deg     0.340 m
-shoulder_lift 90/elbow -90   -16.4 deg   -0.7 deg     0.402 m
-this pose                    +90.0 deg   +0.0 deg     0.312 m
-===========================  ==========  ===========  ============
-
-Both earlier poses left the forearm collinear with the upper arm, the second at 99% of full
-extension. Bending the elbow also keeps the pose away from that fully-extended configuration,
-which is a kinematic singularity where the differential-IK solver loses a DoF."""
-
-_GRASP_APPROACH_DIR_WORLD = (0.0, 0.0, -1.0)
-"""World direction the gripper-to-jaw axis must point while grasping and placing. Pointing it
-straight down makes the arm reach over the cube and close on it from above; these phases
-previously reused the middle pose's orientation, which approached the cube from the side."""
-
-_GRASP_REFERENCE_POSE_DEG = {
-    "shoulder_pan": 0.0,
-    "shoulder_lift": 0.0,
-    "elbow_flex": 0.0,
-    "wrist_flex": 0.0,
-    "wrist_roll": 90.0,
-    "gripper": 0.0,
-}
-"""Joint pose FK-probed in ``setup()`` solely to derive the grasp/place orientation reference.
-
-This pose is never commanded. It exists so the grasp orientation is *independent of*
-``_MIDDLE_POSE_DEG``. The two used to share a single probe, which meant re-tuning the in-air hold
-silently rotated the grasp: dropping the hold's ``wrist_roll`` from 90 to 0 deg rolled the jaw by
-90 deg about the approach axis, so the fingers closed across a different axis of the cube.
-
-Two properties matter here, and both now come from this pose rather than from the hold pose:
-
-* ``wrist_roll`` fixes the jaw's roll about the vertical approach axis, i.e. which way the
-  fingers straddle the cube.
-* ``shoulder_pan`` at 0 with the arm extended puts the jaw unambiguously far out in front, so
-  the base-to-jaw azimuth is a well-conditioned reference heading for ``_top_down_quat`` (a
-  folded pose can put the jaw near the base, where that azimuth is noisy or flips by 180 deg)."""
+Damping sets how fast the implicit PD actuator closes on its commanded angle: the response time is
+roughly ``damping / stiffness``, so the 10.0 used previously meant 0.56 s, more than a third of
+some phases. At 3.0 that drops to 0.17 s -- still comfortably overdamped, so the arm does not
+overshoot and shake the cube loose, but fast enough that every phase settles well before it
+ends."""
 
 _REST_POSE_TOLERANCE_DEG = 30.0
-"""Per-joint +/- tolerance (deg) used by ``_is_at_rest`` to decide if the arm reached
-``_REST_POSE_DEG``. Matches the tolerance used by the shared
-``leisaac.utils.robot_utils.is_so101_at_rest_pose``/``SO101_FOLLOWER_REST_POSE_RANGE`` for every
-joint except ``wrist_roll`` -- this task holds ``wrist_roll`` at 90 deg (not 0 deg) at rest, so it
-uses its own local check instead of the shared one, to avoid shifting the shared rest-pose
-tolerance used by other tasks."""
+"""Per-joint +/- tolerance (deg) used by ``_is_at_rest``. Matches the shared
+``SO101_FOLLOWER_REST_POSE_RANGE`` for every joint except ``wrist_roll`` -- this task rests at
+90 deg rather than 0 deg, so it uses its own local check instead of the shared one, to avoid
+loosening the tolerance for other tasks."""
 
 _HOLD_HEIGHT_ABOVE_TABLE = 0.20
-"""Height (m) above the cube while lifting/carrying/holding it, expressed as a target for the
-*jaw* (see below), not the raw IK control frame. The "middle position" hold target itself is
-FK-calibrated in ``setup()``, not derived from this constant."""
+"""Jaw height (m) above the cube/target while carrying."""
 
-_HOVER_CLEARANCE = 0.10
-"""Jaw height (m) above the cube when hovering, before/after lowering to grasp."""
+_HOVER_CLEARANCE = 0.07
+"""Jaw height (m) above the cube when hovering, before lowering to grasp.
 
-_RELEASE_CLEARANCE = 0.02
-"""Jaw height (m) above the target marker when lowering to release the cube."""
+Kept modest on purpose: a strictly vertical gripper is hardest to reach high up and far out, so a
+tall hover point is where the solver has to start tilting the gripper. 7 cm is ample clearance to
+come down onto a cube."""
+
+_RELEASE_CLEARANCE = 0.03
+"""Jaw height (m) above the target marker when releasing. The jaw holds the cube at its centre and
+the markers sit slightly below the cube's resting centre height, so this drops the cube from just
+above the marker."""
 
 _GRASP_DEPTH_BELOW_CENTER = 0.005
-"""How far (m) *below* the cube's centre the jaw is commanded while descending and grasping.
+"""How far (m) below the cube's centre the jaw is aimed, so the fingers straddle the cube rather
+than grazing its top face."""
 
-A small bias so the fingers straddle the cube rather than grazing its top face. It used to carry
-the whole burden of the controller's tracking error; that is now handled by the closed-loop
-correction below, so this stays small enough to keep the jaw ~1 cm clear of the table."""
-
-_JAW_CORRECTION_GAIN = 0.15
-_JAW_CORRECTION_LIMIT = 0.03
-"""Outer-loop correction on the commanded jaw position.
-
-The differential-IK action is over-constrained -- five joints tracking a 6-DoF pose -- so its
-least-squares solution settles wherever the position and orientation errors balance, leaving a
-*steady-state* position error that no amount of extra settling time removes. Measured in sim: the
-jaw stopped 2.6 cm short of its commanded point after two full seconds of descending onto a
-stationary cube, and the gripper closed on air. So the commanded target is corrected by an
-integral of the observed jaw error, which drives that offset to zero regardless of its source.
-
-The correction is only ever integrated *and applied* while a phase holds its target still (see
-``_PHASE_TARGET_IS_STATIC`` at the call site), and it is reset whenever a moving phase runs. The
-first attempt instead inferred "static" from a per-step movement threshold, and the sim log shows
-why that failed: the approach phase interpolates 0.137 m over 180 steps, i.e. 0.76 mm/step, which
-slipped under the 1 mm threshold. The correction therefore wound up during the approach and
-dragged the command 4 cm sideways, leaving the jaw 12 cm off target when the descent began.
-
-The gain is also far lower than the first attempt's 0.8, which multiplied the approach's ~10 cm
-error into an 8 cm step and slammed the clamp within a single step; the log shows it then
-oscillating rail to rail (``[+0.04, +0.04, ...]`` then ``[+0.04, -0.04, -0.04]``). At 0.15 a
-typical 1.5 cm residual moves the correction ~2 mm per step, converging well inside the 120-step
-descend phase without ever approaching the clamp."""
-
-# Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim
-# tick, so a 60Hz simulation (`--step_hz 60`) requires `round(seconds * 60)` steps for the
-# intended physical duration. `LeRobotRecorderManager` separately downsamples those steps to the
-# requested dataset rate (`--lerobot_dataset_fps 30`, i.e. every second step here).
-# The three phases up to and including the grasp are deliberately generous: the differential-IK
-# solver is over-constrained here (5 joints tracking a 6-DoF pose), so it approaches its target
-# asymptotically rather than reaching it exactly, and cutting a phase short leaves the jaw short
-# of the cube and closing on air.
-_APPROACH_STEPS = 180  # phase ends at 180 (3.0s): interpolate from initial EE pos to cube hover
-_LOWER_TO_CUBE_END = 300  # +120 (2.0s): descend onto the cube and let the IK error settle
-_GRASP_END = 390  # +90 (1.5s): hold still while the gripper actually closes
+# Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim tick,
+# so a 60Hz simulation (`--step_hz 60`) needs `round(seconds * 60)` steps for the intended
+# duration. `LeRobotRecorderManager` separately downsamples those steps to the requested dataset
+# rate (`--lerobot_dataset_fps 30`, i.e. every second step here).
+_APPROACH_STEPS = 180  # phase ends at 180 (3.0s): rest -> hovering above the cube
+_LOWER_TO_CUBE_END = 300  # +120 (2.0s): descend onto the cube
+_GRASP_END = 390  # +90 (1.5s): hold still while the gripper closes
 _LIFT_CUBE_END = 450  # +60 (1.0s)
 _MOVE_TO_MIDDLE_END = 540  # +90 (1.5s)
-_HOLD_MIDDLE_END = 720  # +180 (3.0s) <- user requirement: hold ~3s near the "middle position"
+_HOLD_MIDDLE_END = 720  # +180 (3.0s) <- user requirement: hold ~3s at the "middle position"
 _MOVE_ABOVE_TARGET_END = 810  # +90 (1.5s)
 _LOWER_TO_TARGET_END = 870  # +60 (1.0s)
 _RELEASE_END = 930  # +60 (1.0s)
 _LIFT_GRIPPER_END = 990  # +60 (1.0s)
 _TOTAL_STEPS = 1290  # +300 (5.0s): return home, ends the episode
 
-# DEBUG: (step, phase-name) pairs used by the diagnostic print in get_action() to report which
-# phase is starting and the key positions involved -- remove once the grasp/pose issues are
-# resolved and confirmed fixed in sim.
+# DEBUG: (step, phase-name) pairs used by the diagnostic print in get_action() -- remove once the
+# grasp and hold posture are confirmed correct in sim.
 _PHASE_START_NAMES = (
     (0, "approach_hover"),
     (_APPROACH_STEPS, "lower_to_cube"),
@@ -178,52 +125,14 @@ _PHASE_START_NAMES = (
 )
 
 
-def _quat_nlerp(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.Tensor:
-    """Interpolate unit quaternions along the shortest path using normalized lerp."""
-    end_shortest = torch.where(torch.sum(start * end, dim=-1, keepdim=True) < 0.0, -end, end)
-    interpolated = start + (end_shortest - start) * alpha
-    return interpolated / torch.linalg.vector_norm(interpolated, dim=-1, keepdim=True).clamp_min(1.0e-8)
+def _ease(alpha: float) -> float:
+    """Smoothstep easing, so each phase starts and ends at zero joint velocity.
 
-
-def _quat_between_vectors(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Shortest-arc quaternion rotating ``source`` onto ``target`` (both ``(N, 3)`` world vectors)."""
-    source = source / torch.linalg.vector_norm(source, dim=-1, keepdim=True).clamp_min(1.0e-8)
-    target = target / torch.linalg.vector_norm(target, dim=-1, keepdim=True).clamp_min(1.0e-8)
-
-    cos_angle = torch.sum(source * target, dim=-1, keepdim=True)
-    quat = torch.cat([1.0 + cos_angle, torch.cross(source, target, dim=-1)], dim=-1)
-
-    # Exactly antiparallel vectors have no unique shortest arc; any perpendicular axis gives the
-    # required 180 deg rotation, so pick whichever reference axis is not parallel to ``source``.
-    primary_ref = torch.zeros_like(source)
-    primary_ref[..., 0] = 1.0
-    secondary_ref = torch.zeros_like(source)
-    secondary_ref[..., 1] = 1.0
-    perpendicular = torch.cross(source, primary_ref, dim=-1)
-    perpendicular = torch.where(
-        torch.linalg.vector_norm(perpendicular, dim=-1, keepdim=True) < 1.0e-6,
-        torch.cross(source, secondary_ref, dim=-1),
-        perpendicular,
-    )
-    quat = torch.where(
-        cos_angle < -1.0 + 1.0e-6,
-        torch.cat([torch.zeros_like(cos_angle), perpendicular], dim=-1),
-        quat,
-    )
-    return quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-8)
-
-
-def _azimuth(pos_w: torch.Tensor, base_pos_w: torch.Tensor) -> torch.Tensor:
-    """Heading (rad) from the robot base to ``pos_w``, measured in the world XY plane."""
-    delta = pos_w - base_pos_w
-    return torch.atan2(delta[:, 1], delta[:, 0])
-
-
-def _yaw_quat(angle: torch.Tensor) -> torch.Tensor:
-    """Quaternion for a rotation of ``angle`` (rad, shape ``(N,)``) about the world Z axis."""
-    half = 0.5 * angle
-    zeros = torch.zeros_like(half)
-    return torch.stack([torch.cos(half), zeros, zeros, torch.sin(half)], dim=-1)
+    Plain linear interpolation would step the commanded velocity discontinuously at every phase
+    boundary, which jolts a carried cube.
+    """
+    alpha = min(max(alpha, 0.0), 1.0)
+    return 0.5 - 0.5 * math.cos(math.pi * alpha)
 
 
 def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
@@ -245,13 +154,30 @@ def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor
 class LiftCubePickPlaceStateMachine(StateMachineBase):
     """State machine for the conditional lift-cube pick-and-place (sort) task.
 
-    Picks up the cube, holds it for ~3 seconds at the SO-101 "middle position" (see
-    ``_MIDDLE_POSE_DEG``), then places it on whichever target matches its original spawn side:
-    the circle target if the cube spawned to the right (+X) of the nominal center, or the
+    Picks up the cube, holds it for ~3 seconds at the requested "middle position" (see
+    ``_HOLD_LINK_PITCHES_DEG``), then places it on whichever target matches its original spawn
+    side: the circle target if the cube spawned to the right (+X) of the nominal centre, or the
     square target if it spawned to the left. Finally returns the arm to the SO-101 rest pose.
 
-    Each episode starts by snapping the arm to the rest pose (see ``pre_step()``) before any
-    action is recorded, so every recorded episode begins from a consistent rest state.
+    The whole episode is planned in **joint space**, and this task's action term is configured as a
+    joint-position action to match (see ``devices/action_process.py``). That is deliberate. The
+    SO-101 has five arm joints, so driving it through a differential-IK action that consumes a
+    6-DoF pose is over-constrained: the Jacobian is 6x5 and always has a left-null direction, and
+    the solver comes to rest wherever the residual pose error lies entirely in that direction
+    rather than at the commanded pose. Measured in sim, that trap left the jaw 14 cm from its
+    target at the end of a 3 s approach, so the fingers closed on air, and let the arm drift 23 cm
+    away from a *static* hold command, so the hold posture never looked like the requested one.
+    Both are rank deficiencies, not tuning problems, and no gain or timing change removes them.
+
+    Planning in joint space removes the ambiguity: the four unknowns this task actually needs
+    (``shoulder_pan`` for the heading, plus the three pitch joints for a top-down reach in the
+    arm's own plane) are exactly determined, and are solved in closed form by
+    ``planar_arm_model.PlanarArmModel``, whose parameters are measured from the robot in
+    ``setup()``. Easing between solved configurations also keeps the arm away from the stretched,
+    near-singular poses the IK solver kept falling into.
+
+    Each episode starts by snapping the arm to the rest pose (see ``pre_step()``) before any action
+    is recorded, so every recorded episode begins from a consistent rest state.
     """
 
     TOTAL_STEPS: int = _TOTAL_STEPS
@@ -259,18 +185,16 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     def __init__(self) -> None:
         self._step_count: int = 0
         self._episode_done: bool = False
-        self._initial_ee_pos: torch.Tensor | None = None
-        self._initial_jaw_pos: torch.Tensor | None = None
-        self._initial_ee_quat_world: torch.Tensor | None = None
-        self._rest_ee_pos_world: torch.Tensor | None = None
-        self._rest_ee_quat_world: torch.Tensor | None = None
+        self._model = None
+        self._arm_names: list[str] = []
+        self._arm_indices: torch.Tensor | None = None
+        self._joint_limits: torch.Tensor | None = None
         self._rest_joint_pos: torch.Tensor | None = None
-        self._home_start_pos: torch.Tensor | None = None
-        self._hold_pos_world: torch.Tensor | None = None
-        self._hold_quat_world: torch.Tensor | None = None
-        self._grasp_quat_world: torch.Tensor | None = None
-        self._grasp_azimuth_ref: torch.Tensor | None = None
-        self._jaw_correction: torch.Tensor | None = None
+        self._rest_arm: torch.Tensor | None = None
+        self._hold_arm: torch.Tensor | None = None
+        self._start_arm: torch.Tensor | None = None
+        self._home_start_arm: torch.Tensor | None = None
+        self._cube_pos_w: torch.Tensor | None = None
         self._center_x: float = 0.0
         self._target_is_circle: torch.Tensor | None = None
 
@@ -279,86 +203,94 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     # ------------------------------------------------------------------
 
     def setup(self, env) -> None:
-        """FK calibration for the rest, grasp-reference and middle poses; other one-time setup.
+        """Measure the arm's kinematics, then solve the fixed poses the episode is built from.
 
-        Teleports the joints to each of ``_REST_POSE_DEG``, ``_GRASP_REFERENCE_POSE_DEG`` and
-        ``_MIDDLE_POSE_DEG`` in turn, reading the corresponding world-space gripper/jaw poses via
-        FK. The rest and middle results are used as ordinary IK targets during the episode, so
-        the arm reaches them through smooth, physically-simulated motion rather than teleporting
-        while carrying the cube. The grasp-reference result only supplies the grasp orientation
-        and reference heading; that pose is never commanded.
+        Nine forward-kinematics probes pin down every parameter in closed form, because sweeping
+        one joint sends the jaw around a circle centred on that joint (see
+        ``planar_arm_model.calibrate_planar_arm``). Measuring beats hard-coding here: the link
+        lengths and joint-angle offsets that come out of this are exactly the quantities earlier
+        revisions guessed at, and guessed wrong.
 
-        Keeping the grasp reference on its own probe is what stops a change to the in-air hold
-        pose from rotating the grasp -- see ``_GRASP_REFERENCE_POSE_DEG``.
+        Two details of the probe pose matter and are easy to get wrong:
 
-        The caller resets the environment after ``setup()``, so none of these calibration poses
-        leak into the first recorded episode.
+        * ``wrist_roll`` and the gripper both move the jaw frame, so both are held at the values
+          used during the episode. Calibrating with the gripper closed is deliberate -- that is
+          the point where the fingers meet, so aiming *it* at the cube while the fingers are still
+          open makes them straddle the cube and close on it.
+        * The caller resets the environment after ``setup()``, so none of these probe poses leak
+          into the first recorded episode.
 
         ``center_x`` (the left/right decision threshold) is derived from the cube's *nominal*
-        (pre-randomization) spawn point, i.e. ``env.cfg.scene.cube.init_state.pos`` -- the same
+        (pre-randomisation) spawn point, i.e. ``env.cfg.scene.cube.init_state.pos`` -- the same
         fixed value the env config uses to place the two targets and to seed ``center_x`` in
-        ``mdp.cube_placed_on_correct_target``/``cube_pick_place_done``. Reading this from the
-        config (rather than the live, possibly-already-randomized ``root_pos_w``) guarantees the
-        state machine's target choice always agrees with the success-check's.
+        ``mdp.cube_placed_on_correct_target``/``cube_pick_place_done``. Reading it from the config
+        rather than from the live, possibly-already-randomised ``root_pos_w`` guarantees the state
+        machine's target choice always agrees with the success check's.
         """
         robot = env.scene["robot"]
-        # Use the ee_frame's "gripper" target (index 0, no offset) rather than
-        # `robot.data.body_pos_w[:, -1, :]` -- the latter is whatever body happens to be *last*
-        # in the articulation's body list, which is not guaranteed to be "gripper" if e.g. "jaw"
-        # is a separate body ordered after it. This keeps every EE-space position in this file
-        # anchored to the exact same, explicitly-named prim that the IK action also targets.
         ee_frame = env.scene["ee_frame"]
         joint_names = list(robot.data.joint_names)
 
-        def to_joint_pos(pose_deg: dict[str, float]) -> torch.Tensor:
+        # The action manager lays the arm term out in the articulation's own joint order, so build
+        # every command vector in that order rather than in ``_ARM_JOINT_NAMES`` order.
+        self._arm_names = [name for name in joint_names if name in _ARM_JOINT_NAMES]
+        self._arm_indices = torch.tensor([joint_names.index(name) for name in self._arm_names], device=env.device)
+        self._joint_limits = torch.tensor(
+            [[math.radians(value) for value in SO101_FOLLOWER_USD_JOINT_LIMLITS[name]] for name in self._arm_names],
+            device=env.device,
+        )
+
+        def write_pose(pose_deg: dict[str, float]) -> torch.Tensor:
             joint_pos = torch.zeros(env.num_envs, len(joint_names), device=env.device)
             for idx, name in enumerate(joint_names):
-                if name in pose_deg:
-                    joint_pos[:, idx] = pose_deg[name] * torch.pi / 180.0
-            return joint_pos
-
-        def fk_probe(pose_deg: dict[str, float]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            """Teleport to ``pose_deg`` and return its (gripper_pos, gripper_quat, jaw_pos) in world."""
-            joint_pos = to_joint_pos(pose_deg)
+                joint_pos[:, idx] = math.radians(pose_deg.get(name, 0.0))
             robot.write_joint_state_to_sim(position=joint_pos, velocity=torch.zeros_like(joint_pos))
             env.sim.step(render=False)
             env.scene.update(dt=env.physics_dt)
-            return (
-                ee_frame.data.target_pos_w[:, 0, :].clone(),
-                ee_frame.data.target_quat_w[:, 0, :].clone(),
-                ee_frame.data.target_pos_w[:, 1, :].clone(),
-            )
+            return joint_pos
 
-        self._rest_joint_pos = to_joint_pos(_REST_POSE_DEG)
-        self._rest_ee_pos_world, self._rest_ee_quat_world, _ = fk_probe(_REST_POSE_DEG)
+        def probe(pan_deg: float, lift_deg: float, elbow_deg: float, wrist_flex_deg: float):
+            write_pose({
+                "shoulder_pan": pan_deg,
+                "shoulder_lift": lift_deg,
+                "elbow_flex": elbow_deg,
+                "wrist_flex": wrist_flex_deg,
+                "wrist_roll": _WRIST_ROLL_DEG,
+                "gripper": math.degrees(_GRIPPER_CLOSE_RAD),
+            })
+            jaw_pos_w = ee_frame.data.target_pos_w[:, 1, :]
+            jaw_pos_b = quat_apply(quat_inv(robot.data.root_quat_w), jaw_pos_w - robot.data.root_pos_w)
+            return tuple(float(value) for value in jaw_pos_b[0])
 
-        # Grasp/place orientation and reference heading, derived from a dedicated probe so they
-        # stay fixed no matter how `_MIDDLE_POSE_DEG` is tuned. The orientation rotates the
-        # probe's orientation by the shortest arc that brings its gripper-to-jaw axis onto
-        # straight down, so the jaw closes on the cube from above.
-        ref_gripper_pos, ref_gripper_quat, ref_jaw_pos = fk_probe(_GRASP_REFERENCE_POSE_DEG)
-        approach_dir = ref_jaw_pos - ref_gripper_pos
-        down_dir = torch.tensor(_GRASP_APPROACH_DIR_WORLD, device=env.device).expand_as(approach_dir)
-        self._grasp_quat_world = quat_mul(_quat_between_vectors(approach_dir, down_dir), ref_gripper_quat)
-        self._grasp_azimuth_ref = _azimuth(ref_jaw_pos, robot.data.root_pos_w)
+        self._model = calibrate_planar_arm(probe, delta_deg=_CALIB_DELTA_DEG)
 
-        # In-air hold target. Only this phase uses the middle pose.
-        _, self._hold_quat_world, self._hold_pos_world = fk_probe(_MIDDLE_POSE_DEG)
+        hold_lift, hold_elbow, hold_wrist_flex = self._model.joints_for_link_pitches(*_HOLD_LINK_PITCHES_DEG)
+        self._hold_arm = self._arm_command(
+            env,
+            {
+                "shoulder_pan": 0.0,
+                "shoulder_lift": hold_lift,
+                "elbow_flex": hold_elbow,
+                "wrist_flex": hold_wrist_flex,
+                "wrist_roll": math.radians(_WRIST_ROLL_DEG),
+            },
+        )
+        self._rest_arm = self._arm_command(env, {name: math.radians(_REST_POSE_DEG[name]) for name in self._arm_names})
 
-        nominal_cube_pos = env.cfg.scene.cube.init_state.pos
-        self._center_x = float(nominal_cube_pos[0])
+        self._center_x = float(env.cfg.scene.cube.init_state.pos[0])
 
-        # DEBUG: dump the FK-calibrated references (env 0 only) -- remove together with the
-        # per-phase print in get_action() once the poses are confirmed correct in sim.
+        # DEBUG: report the measured model and check that the hold posture actually lands where the
+        # model says it should -- remove together with the per-phase print once confirmed in sim.
+        measured = probe(0.0, math.degrees(hold_lift), math.degrees(hold_elbow), math.degrees(hold_wrist_flex))
+        predicted = self._model.jaw_in_plane(hold_lift, hold_elbow, hold_wrist_flex)
+        residual = math.dist(self._model.to_plane(measured), predicted)
+        self._rest_joint_pos = write_pose(_REST_POSE_DEG)
         print(
-            f"[LiftCubePickPlace][setup] robot_base_pos={robot.data.root_pos_w[0].tolist()} "
-            f"rest_gripper_pos={self._rest_ee_pos_world[0].tolist()} "
-            f"grasp_ref_jaw_pos={ref_jaw_pos[0].tolist()} "
-            f"grasp_ref_approach_dir={approach_dir[0].tolist()} "
-            f"grasp_quat_world={self._grasp_quat_world[0].tolist()} "
-            f"grasp_azimuth_ref_deg={float(self._grasp_azimuth_ref[0]) * 180.0 / torch.pi:.1f} "
-            f"hold_jaw_pos={self._hold_pos_world[0].tolist()} "
-            f"hold_quat_world={self._hold_quat_world[0].tolist()} "
+            f"[LiftCubePickPlace][setup] {self._model.describe()}\n"
+            f"[LiftCubePickPlace][setup] hold joints (deg): shoulder_lift={math.degrees(hold_lift):.2f} "
+            f"elbow_flex={math.degrees(hold_elbow):.2f} wrist_flex={math.degrees(hold_wrist_flex):.2f} "
+            f"-> link pitches {_HOLD_LINK_PITCHES_DEG} deg, jaw at forward={predicted[0]:.4f} "
+            f"height={predicted[1]:.4f} m, model-vs-measured residual={residual * 1000.0:.1f} mm, "
             f"center_x={self._center_x}"
         )
 
@@ -390,168 +322,115 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         return bool(torch.logical_and(placed, at_rest).all().item())
 
     def pre_step(self, env) -> None:
-        """Snap to rest before the first step, then blend back to rest at the end.
+        """Snap to the rest pose before the first step of an episode.
 
-        The middle target was calibrated once in ``setup()`` from the explicit middle joint
-        pose. The initial snap ensures every recorded episode starts from a consistent rest
-        state, matching the direct joint-state-write technique used at the end.
+        Every recorded episode then starts from the same state. Nothing is written after that --
+        the return-home phase commands the rest joint angles like any other phase, so the arm
+        drives there under normal actuation instead of being teleported while recording runs.
         """
-        robot = env.scene["robot"]
         if self._step_count == 0 and self._rest_joint_pos is not None:
+            robot = env.scene["robot"]
             robot.write_joint_state_to_sim(
                 position=self._rest_joint_pos,
                 velocity=torch.zeros_like(self._rest_joint_pos),
             )
             env.scene.update(dt=env.physics_dt)
-        if self._step_count >= _LIFT_GRIPPER_END and self._rest_joint_pos is not None:
-            if self._step_count == _LIFT_GRIPPER_END:
-                self._home_start_pos = robot.data.joint_pos.clone()
-            if self._home_start_pos is not None:
-                alpha = min((self._step_count - _LIFT_GRIPPER_END) / float(_TOTAL_STEPS - _LIFT_GRIPPER_END - 1), 1.0)
-                blended = self._home_start_pos + (self._rest_joint_pos - self._home_start_pos) * alpha
-                robot.write_joint_state_to_sim(position=blended, velocity=torch.zeros_like(blended))
 
     def get_action(self, env) -> torch.Tensor:
-        """Compute the action tensor for the current step (8D IK pose target).
+        """Compute the action for the current step: five arm joint angles plus the gripper.
 
-        Cube/target positions below describe where the *jaw* (fingertip contact point, see
-        ``ee_frame``'s second target frame) should be -- not the raw "gripper" IK control frame,
-        which sits at a fixed but non-trivial offset from the jaw. The rigid offset is measured
-        live, expressed in the gripper's local frame, then rotated by the *target* gripper
-        orientation before being subtracted from every jaw target. This is necessary because
-        using the current world-space offset is only correct when current and target
-        orientations already match.
+        Cube and target positions describe where the *jaw* should be -- the point where the fingers
+        meet, i.e. ``ee_frame``'s second target frame with the gripper closed, which is what the
+        kinematic model was calibrated against.
 
-        Every jaw target additionally passes through ``_update_jaw_correction()``, which cancels
-        the over-constrained IK's steady-state position error (see ``_JAW_CORRECTION_GAIN``).
-
-        The target orientation is scheduled per phase by ``_target_orientation()``: grasping and
-        placing point the jaw straight down and yaw it toward whichever object is being reached,
-        the mid-air hold uses the middle orientation, and return-home restores the rest
-        orientation, with smooth interpolation in between.
+        Phases either hold a solved configuration or ease between two of them, so consecutive
+        phases always agree at their shared boundary and the commanded joint velocity is zero
+        there.
         """
         robot = env.scene["robot"]
-        robot.write_joint_damping_to_sim(damping=10.0)
+        robot.write_joint_damping_to_sim(damping=_JOINT_DAMPING)
 
-        device = env.device
-        num_envs = env.num_envs
         step = self._step_count
 
-        cube_pos_w = env.scene["cube"].data.root_pos_w.clone()
-        target_pos_w = env.scene["target"].data.root_pos_w.clone()
-        circle_target_pos_w = env.scene["circle_target"].data.root_pos_w.clone()
-        robot_base_pos_w = robot.data.root_pos_w.clone()
-        robot_base_quat_w = robot.data.root_quat_w.clone()
-
-        ee_frame = env.scene["ee_frame"]
-        current_gripper_quat_w = ee_frame.data.target_quat_w[:, 0, :].clone()
-        jaw_pos_w = ee_frame.data.target_pos_w[:, 1, :].clone()
-
         if step == 0:
-            self._initial_ee_pos = ee_frame.data.target_pos_w[:, 0, :].clone()
-            self._initial_jaw_pos = ee_frame.data.target_pos_w[:, 1, :].clone()
-            self._initial_ee_quat_world = current_gripper_quat_w.clone()
-            self._target_is_circle = cube_pos_w[:, 0] > self._center_x
-            self._jaw_correction = torch.zeros(num_envs, 3, device=device)
+            # The cube only moves once the gripper touches it, so freezing its pose here keeps the
+            # whole approach aimed at one fixed point instead of chasing a cube it just nudged.
+            self._cube_pos_w = env.scene["cube"].data.root_pos_w.clone()
+            self._target_is_circle = self._cube_pos_w[:, 0] > self._center_x
+            self._start_arm = robot.data.joint_pos[:, self._arm_indices].clone()
 
-        selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
-
-        target_quat_w = self._target_orientation(
-            step,
-            current_gripper_quat_w,
-            robot_base_pos_w=robot_base_pos_w,
-            cube_pos_w=cube_pos_w,
-            place_pos_w=selected_target_pos_w,
+        place_pos_w = torch.where(
+            self._target_is_circle.unsqueeze(-1),
+            env.scene["circle_target"].data.root_pos_w,
+            env.scene["target"].data.root_pos_w,
         )
-        target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
 
-        gripper_to_jaw_world = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
-        gripper_to_jaw_local = quat_apply(quat_inv(current_gripper_quat_w), gripper_to_jaw_world)
-        gripper_to_jaw = quat_apply(target_quat_w, gripper_to_jaw_local)
+        def raised(base_pos: torch.Tensor, height: float) -> torch.Tensor:
+            shifted = base_pos.clone()
+            shifted[:, 2] += height
+            return shifted
 
-        # DEBUG: report which phase is starting and the key positions involved (env 0 only) --
-        # remove once the grasp/pose issues are resolved and confirmed fixed in sim.
-        for boundary_step, phase_name in _PHASE_START_NAMES:
-            if step == boundary_step:
-                print(
-                    f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
-                    f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={jaw_pos_w[0].tolist()} "
-                    f"jaw_minus_cube={(jaw_pos_w[0] - cube_pos_w[0]).tolist()} "
-                    f"jaw_correction={self._jaw_correction[0].tolist() if self._jaw_correction is not None else None} "
-                    f"gripper_to_jaw={gripper_to_jaw[0].tolist()} "
-                    f"current_quat_w={current_gripper_quat_w[0].tolist()} "
-                    f"target_quat_w={target_quat_w[0].tolist()} "
-                    f"hold_pos_world={self._hold_pos_world[0].tolist() if self._hold_pos_world is not None else None} "
-                    f"rest_ee_pos_world={self._rest_ee_pos_world[0].tolist() if self._rest_ee_pos_world is not None else None}"
-                )
-                break
+        def solve(jaw_target_w: torch.Tensor) -> torch.Tensor:
+            return self._solve_arm(robot, jaw_target_w)
+
+        hover = raised(self._cube_pos_w, _HOVER_CLEARANCE)
+        grasp = raised(self._cube_pos_w, -_GRASP_DEPTH_BELOW_CENTER)
+        lifted = raised(self._cube_pos_w, _HOLD_HEIGHT_ABOVE_TABLE)
+        place_hover = raised(place_pos_w, _HOLD_HEIGHT_ABOVE_TABLE)
+        place_release = raised(place_pos_w, _RELEASE_CLEARANCE)
 
         if step < _APPROACH_STEPS:
-            jaw_target_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, num_envs, device)
-            target_is_static = False
+            arm = self._blend(self._start_arm, solve(hover), step / _APPROACH_STEPS)
+            gripper = _GRIPPER_OPEN_RAD
         elif step < _LOWER_TO_CUBE_END:
-            jaw_target_w, gripper_cmd = self._phase_lower_to_cube(cube_pos_w, num_envs, device)
-            target_is_static = True
+            arm = self._blend(solve(hover), solve(grasp), self._progress(step, _APPROACH_STEPS, _LOWER_TO_CUBE_END))
+            gripper = _GRIPPER_OPEN_RAD
         elif step < _GRASP_END:
-            jaw_target_w, gripper_cmd = self._phase_grasp(cube_pos_w, num_envs, device)
-            target_is_static = True
+            arm = solve(grasp)
+            gripper = _GRIPPER_CLOSE_RAD
         elif step < _LIFT_CUBE_END:
-            jaw_target_w, gripper_cmd = self._phase_lift_cube(cube_pos_w, num_envs, device)
-            target_is_static = True
+            arm = self._blend(solve(grasp), solve(lifted), self._progress(step, _GRASP_END, _LIFT_CUBE_END))
+            gripper = _GRIPPER_CLOSE_RAD
         elif step < _MOVE_TO_MIDDLE_END:
-            jaw_target_w, gripper_cmd = self._phase_move_to_middle(cube_pos_w, num_envs, device)
-            target_is_static = False
+            arm = self._blend(solve(lifted), self._hold_arm, self._progress(step, _LIFT_CUBE_END, _MOVE_TO_MIDDLE_END))
+            gripper = _GRIPPER_CLOSE_RAD
         elif step < _HOLD_MIDDLE_END:
-            jaw_target_w, gripper_cmd = self._phase_hold_middle(num_envs, device)
-            target_is_static = True
+            arm = self._hold_arm.clone()
+            gripper = _GRIPPER_CLOSE_RAD
         elif step < _MOVE_ABOVE_TARGET_END:
-            jaw_target_w, gripper_cmd = self._phase_move_above_target(selected_target_pos_w, num_envs, device)
-            target_is_static = False
-        elif step < _LOWER_TO_TARGET_END:
-            jaw_target_w, gripper_cmd = self._phase_lower_to_target(selected_target_pos_w, num_envs, device)
-            target_is_static = True
-        elif step < _RELEASE_END:
-            jaw_target_w, gripper_cmd = self._phase_release(selected_target_pos_w, num_envs, device)
-            target_is_static = True
-        elif step < _LIFT_GRIPPER_END:
-            jaw_target_w, gripper_cmd = self._phase_lift_gripper(selected_target_pos_w, num_envs, device)
-            target_is_static = True
-        else:
-            jaw_target_w = None
-            pos_w, gripper_cmd = self._phase_return_home(num_envs, device)
-
-        if jaw_target_w is not None:
-            pos_w = (
-                jaw_target_w + self._update_jaw_correction(jaw_target_w, jaw_pos_w, target_is_static) - gripper_to_jaw
+            arm = self._blend(
+                self._hold_arm, solve(place_hover), self._progress(step, _HOLD_MIDDLE_END, _MOVE_ABOVE_TARGET_END)
             )
+            gripper = _GRIPPER_CLOSE_RAD
+        elif step < _LOWER_TO_TARGET_END:
+            arm = self._blend(
+                solve(place_hover),
+                solve(place_release),
+                self._progress(step, _MOVE_ABOVE_TARGET_END, _LOWER_TO_TARGET_END),
+            )
+            gripper = _GRIPPER_CLOSE_RAD
+        elif step < _RELEASE_END:
+            arm = solve(place_release)
+            gripper = _GRIPPER_OPEN_RAD
+        elif step < _LIFT_GRIPPER_END:
+            arm = self._blend(
+                solve(place_release), solve(place_hover), self._progress(step, _RELEASE_END, _LIFT_GRIPPER_END)
+            )
+            gripper = _GRIPPER_OPEN_RAD
         else:
-            # Return-home is commanded directly in the gripper frame, and ``pre_step`` drives the
-            # joints to the rest pose anyway, so the correction neither applies nor carries over.
-            self._jaw_correction = None
+            if self._home_start_arm is None:
+                self._home_start_arm = solve(place_hover)
+            arm = self._blend(
+                self._home_start_arm, self._rest_arm, self._progress(step, _LIFT_GRIPPER_END, _TOTAL_STEPS)
+            )
+            # The gripper stays open through return-home: the success check reads the live gripper
+            # angle to confirm the cube was released, and only teleports to the rest pose after.
+            gripper = _GRIPPER_OPEN_RAD
 
-        diff_w = pos_w - robot_base_pos_w
-        target_pos_local = quat_apply(quat_inv(robot_base_quat_w), diff_w)
-        return torch.cat([target_pos_local, target_quat, gripper_cmd], dim=-1)
+        self._log_phase_start(env, robot, step, arm)
 
-    def _update_jaw_correction(
-        self, jaw_target_w: torch.Tensor, jaw_pos_w: torch.Tensor, target_is_static: bool
-    ) -> torch.Tensor:
-        """Integrate the jaw tracking error, but only while the phase holds its target still.
-
-        See ``_JAW_CORRECTION_GAIN`` for why this outer loop exists and why it must stay off
-        during the interpolated phases: there the error is dominated by ordinary transit lag,
-        which is not an offset to be cancelled. Those phases also reset the accumulator, so every
-        static phase starts from zero and cannot inherit a stale bias from the previous one.
-        """
-        if not target_is_static:
-            self._jaw_correction = torch.zeros_like(jaw_target_w)
-            return self._jaw_correction
-        if self._jaw_correction is None:
-            self._jaw_correction = torch.zeros_like(jaw_target_w)
-        self._jaw_correction = (self._jaw_correction + _JAW_CORRECTION_GAIN * (jaw_target_w - jaw_pos_w)).clamp(
-            -_JAW_CORRECTION_LIMIT, _JAW_CORRECTION_LIMIT
-        )
-        return self._jaw_correction
+        gripper_cmd = torch.full((env.num_envs, 1), gripper, device=env.device)
+        return torch.cat([arm, gripper_cmd], dim=-1)
 
     def advance(self) -> None:
         """Advance the step counter; the episode ends once the return-home phase completes."""
@@ -563,147 +442,73 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         """Reset the state machine to its initial state for a new episode."""
         self._step_count = 0
         self._episode_done = False
-        self._initial_ee_pos = None
-        self._initial_jaw_pos = None
-        self._initial_ee_quat_world = None
-        self._home_start_pos = None
-        self._jaw_correction = None
+        self._start_arm = None
+        self._home_start_arm = None
+        self._cube_pos_w = None
         self._target_is_circle = None
 
     # ------------------------------------------------------------------
-    # Orientation schedule
+    # Joint-space helpers
     # ------------------------------------------------------------------
 
-    def _top_down_quat(self, pos_w: torch.Tensor, robot_base_pos_w: torch.Tensor) -> torch.Tensor:
-        """Top-down orientation yawed toward ``pos_w`` as seen from the robot base.
+    def _arm_command(self, env, values: dict[str, float | torch.Tensor]) -> torch.Tensor:
+        """Assemble a ``(num_envs, 5)`` arm command from per-joint angles, clamped to the limits."""
+        columns = []
+        for name in self._arm_names:
+            value = values[name]
+            if not isinstance(value, torch.Tensor):
+                value = torch.full((env.num_envs,), float(value), device=env.device)
+            columns.append(value)
+        return torch.clamp(torch.stack(columns, dim=-1), self._joint_limits[:, 0], self._joint_limits[:, 1])
 
-        The IK action drives only five joints (``shoulder_pan`` plus three pitch joints and
-        ``wrist_roll``) while the command is a full 6-DoF pose, so an orientation whose yaw does
-        not match the arm's own swing plane is unreachable and the solver trades away position
-        accuracy to chase it -- which is what made the gripper close on empty air. Rotating about
-        the world Z axis leaves the jaw pointing straight down while matching the heading
-        ``shoulder_pan`` produces, keeping the command inside the reachable set.
+    def _solve_arm(self, robot, jaw_target_w: torch.Tensor) -> torch.Tensor:
+        """Arm command that puts the jaw at ``jaw_target_w`` with the gripper pointing down."""
+        jaw_target_b = quat_apply(quat_inv(robot.data.root_quat_w), jaw_target_w - robot.data.root_pos_w)
+        wrist_flex_limits = tuple(math.radians(value) for value in SO101_FOLLOWER_USD_JOINT_LIMLITS["wrist_flex"])
+        solution = self._model.top_down_joints(jaw_target_b, wrist_flex_limits=wrist_flex_limits)
+        values = {
+            "shoulder_pan": solution[:, 0],
+            "shoulder_lift": solution[:, 1],
+            "elbow_flex": solution[:, 2],
+            "wrist_flex": solution[:, 3],
+            "wrist_roll": torch.full_like(solution[:, 0], math.radians(_WRIST_ROLL_DEG)),
+        }
+        columns = [values[name] for name in self._arm_names]
+        return torch.clamp(torch.stack(columns, dim=-1), self._joint_limits[:, 0], self._joint_limits[:, 1])
+
+    @staticmethod
+    def _progress(step: int, start: int, end: int) -> float:
+        return (step - start) / float(end - start)
+
+    @staticmethod
+    def _blend(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.Tensor:
+        """Ease from ``start`` to ``end`` in joint space."""
+        return start + (end - start) * _ease(alpha)
+
+    def _log_phase_start(self, env, robot, step: int, arm: torch.Tensor) -> None:
+        """DEBUG: report the commanded and achieved state at each phase boundary.
+
+        Remove once the grasp and hold posture are confirmed correct in sim.
         """
-        delta_yaw = _azimuth(pos_w, robot_base_pos_w) - self._grasp_azimuth_ref
-        delta_yaw = torch.atan2(torch.sin(delta_yaw), torch.cos(delta_yaw))  # wrap to [-pi, pi]
-        return quat_mul(_yaw_quat(delta_yaw), self._grasp_quat_world)
-
-    def _target_orientation(
-        self,
-        step: int,
-        current_gripper_quat_w: torch.Tensor,
-        robot_base_pos_w: torch.Tensor,
-        cube_pos_w: torch.Tensor,
-        place_pos_w: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return the world-space gripper orientation commanded at ``step``.
-
-        Picking the cube up and releasing it onto a marker both use the top-down orientation
-        yawed toward that object, so the jaw descends onto it rather than reaching in sideways.
-        Only the mid-air hold uses the middle orientation, which is left exactly as calibrated so
-        the hold reproduces the middle pose, and the episode ends back at the rest orientation.
-        """
-        if self._grasp_quat_world is None or self._hold_quat_world is None or self._grasp_azimuth_ref is None:
-            return current_gripper_quat_w
-
-        cube_quat = self._top_down_quat(cube_pos_w, robot_base_pos_w)
-        place_quat = self._top_down_quat(place_pos_w, robot_base_pos_w)
-
-        if step < _APPROACH_STEPS:
-            start_quat = (
-                self._initial_ee_quat_world if self._initial_ee_quat_world is not None else current_gripper_quat_w
-            )
-            return _quat_nlerp(start_quat, cube_quat, step / float(_APPROACH_STEPS))
-        if step < _LIFT_CUBE_END:
-            return cube_quat
-        if step < _MOVE_TO_MIDDLE_END:
-            alpha = (step - _LIFT_CUBE_END) / float(_MOVE_TO_MIDDLE_END - _LIFT_CUBE_END)
-            return _quat_nlerp(cube_quat, self._hold_quat_world, alpha)
-        if step < _HOLD_MIDDLE_END:
-            return self._hold_quat_world.clone()
-        if step < _MOVE_ABOVE_TARGET_END:
-            alpha = (step - _HOLD_MIDDLE_END) / float(_MOVE_ABOVE_TARGET_END - _HOLD_MIDDLE_END)
-            return _quat_nlerp(self._hold_quat_world, place_quat, alpha)
-        if step < _LIFT_GRIPPER_END:
-            return place_quat
-        if self._rest_ee_quat_world is not None:
-            return self._rest_ee_quat_world.clone()
-        return current_gripper_quat_w
-
-    # ------------------------------------------------------------------
-    # Phase methods
-    #
-    # Each phase (other than the final return-home) returns a *jaw* target position in world
-    # space. ``get_action()`` applies the outer-loop correction and subtracts the gripper-to-jaw
-    # offset to get the actual IK ("gripper" frame) target sent to the arm.
-    # ------------------------------------------------------------------
-
-    def _phase_approach_hover(self, cube_pos_w, num_envs, device):
-        hover_jaw = cube_pos_w.clone()
-        hover_jaw[:, 2] += _HOVER_CLEARANCE
-        alpha = self._step_count / _APPROACH_STEPS
-        if self._initial_jaw_pos is not None:
-            jaw_target = (1.0 - alpha) * self._initial_jaw_pos + alpha * hover_jaw
-        else:
-            jaw_target = hover_jaw
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
-
-    def _phase_lower_to_cube(self, cube_pos_w, num_envs, device):
-        jaw_target = cube_pos_w.clone()
-        jaw_target[:, 2] -= _GRASP_DEPTH_BELOW_CENTER
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
-
-    def _phase_grasp(self, cube_pos_w, num_envs, device):
-        jaw_target = cube_pos_w.clone()
-        jaw_target[:, 2] -= _GRASP_DEPTH_BELOW_CENTER
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
-
-    def _phase_lift_cube(self, cube_pos_w, num_envs, device):
-        jaw_target = cube_pos_w.clone()
-        jaw_target[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
-
-    def _phase_move_to_middle(self, cube_pos_w, num_envs, device):
-        lift_jaw = cube_pos_w.clone()
-        lift_jaw[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        alpha = (self._step_count - _LIFT_CUBE_END) / float(_MOVE_TO_MIDDLE_END - _LIFT_CUBE_END)
-        jaw_target = (1.0 - alpha) * lift_jaw + alpha * self._hold_pos_world
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
-
-    def _phase_hold_middle(self, num_envs, device):
-        jaw_target = self._hold_pos_world.clone()
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
-
-    def _phase_move_above_target(self, selected_target_pos_w, num_envs, device):
-        target_hover = selected_target_pos_w.clone()
-        target_hover[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        alpha = (self._step_count - _HOLD_MIDDLE_END) / float(_MOVE_ABOVE_TARGET_END - _HOLD_MIDDLE_END)
-        jaw_target = (1.0 - alpha) * self._hold_pos_world + alpha * target_hover
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
-
-    def _phase_lower_to_target(self, selected_target_pos_w, num_envs, device):
-        jaw_target = selected_target_pos_w.clone()
-        jaw_target[:, 2] += _RELEASE_CLEARANCE
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
-
-    def _phase_release(self, selected_target_pos_w, num_envs, device):
-        jaw_target = selected_target_pos_w.clone()
-        jaw_target[:, 2] += _RELEASE_CLEARANCE
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
-
-    def _phase_lift_gripper(self, selected_target_pos_w, num_envs, device):
-        jaw_target = selected_target_pos_w.clone()
-        jaw_target[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
-
-    def _phase_return_home(self, num_envs, device):
-        if self._rest_ee_pos_world is not None:
-            pos_w = self._rest_ee_pos_world.clone()
-        elif self._initial_ee_pos is not None:
-            pos_w = self._initial_ee_pos.clone()
-        else:
-            pos_w = torch.zeros(num_envs, 3, device=device)
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+        phase_name = next((name for boundary, name in _PHASE_START_NAMES if boundary == step), None)
+        if phase_name is None:
+            return
+        jaw_pos_w = env.scene["ee_frame"].data.target_pos_w[:, 1, :]
+        cube_pos_w = env.scene["cube"].data.root_pos_w
+        commanded = {name: float(arm[0, idx]) for idx, name in enumerate(self._arm_names)}
+        pitches = self._model.pitches_from_joints(
+            commanded["shoulder_lift"], commanded["elbow_flex"], commanded["wrist_flex"]
+        )
+        measured = robot.data.joint_pos[0, self._arm_indices]
+        print(
+            f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
+            f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={jaw_pos_w[0].tolist()} "
+            f"jaw_minus_cube={(jaw_pos_w[0] - cube_pos_w[0]).tolist()} "
+            f"joints={self._arm_names} "
+            f"cmd_deg={[round(math.degrees(float(value)), 1) for value in arm[0]]} "
+            f"actual_deg={[round(math.degrees(float(value)), 1) for value in measured]} "
+            f"cmd_link_pitch_deg={[round(math.degrees(wrap_to_pi(value)), 1) for value in pitches]}"
+        )
 
     # ------------------------------------------------------------------
     # Properties
