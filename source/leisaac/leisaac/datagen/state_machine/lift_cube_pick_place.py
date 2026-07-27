@@ -127,6 +127,19 @@ def _quat_between_vectors(source: torch.Tensor, target: torch.Tensor) -> torch.T
     return quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-8)
 
 
+def _azimuth(pos_w: torch.Tensor, base_pos_w: torch.Tensor) -> torch.Tensor:
+    """Heading (rad) from the robot base to ``pos_w``, measured in the world XY plane."""
+    delta = pos_w - base_pos_w
+    return torch.atan2(delta[:, 1], delta[:, 0])
+
+
+def _yaw_quat(angle: torch.Tensor) -> torch.Tensor:
+    """Quaternion for a rotation of ``angle`` (rad, shape ``(N,)``) about the world Z axis."""
+    half = 0.5 * angle
+    zeros = torch.zeros_like(half)
+    return torch.stack([torch.cos(half), zeros, zeros, torch.sin(half)], dim=-1)
+
+
 def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
     """Check whether every joint is within ``_REST_POSE_TOLERANCE_DEG`` of ``_REST_POSE_DEG``."""
     is_rest = torch.ones(joint_pos.shape[0], dtype=torch.bool, device=joint_pos.device)
@@ -170,6 +183,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._hold_pos_world: torch.Tensor | None = None
         self._hold_quat_world: torch.Tensor | None = None
         self._grasp_quat_world: torch.Tensor | None = None
+        self._grasp_azimuth_ref: torch.Tensor | None = None
         self._center_x: float = 0.0
         self._target_is_circle: torch.Tensor | None = None
 
@@ -242,6 +256,10 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             _quat_between_vectors(middle_approach_dir, down_dir),
             self._hold_quat_world,
         )
+        # Heading of the middle pose's jaw around the robot base. ``_top_down_quat`` re-yaws the
+        # orientation above relative to this reference, so the commanded pose stays inside the
+        # vertical plane that ``shoulder_pan`` actually swings the arm through.
+        self._grasp_azimuth_ref = _azimuth(self._hold_pos_world, robot.data.root_pos_w)
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
@@ -307,8 +325,9 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         orientations already match.
 
         The target orientation is scheduled per phase by ``_target_orientation()``: grasping and
-        placing use the top-down orientation, the mid-air hold uses the middle orientation, and
-        return-home restores the rest orientation, with smooth interpolation in between.
+        placing point the jaw straight down and yaw it toward whichever object is being reached,
+        the mid-air hold uses the middle orientation, and return-home restores the rest
+        orientation, with smooth interpolation in between.
         """
         robot = env.scene["robot"]
         robot.write_joint_damping_to_sim(damping=10.0)
@@ -331,14 +350,20 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             self._initial_ee_quat_world = current_gripper_quat_w.clone()
             self._target_is_circle = cube_pos_w[:, 0] > self._center_x
 
-        target_quat_w = self._target_orientation(step, current_gripper_quat_w)
+        selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
+
+        target_quat_w = self._target_orientation(
+            step,
+            current_gripper_quat_w,
+            robot_base_pos_w=robot_base_pos_w,
+            cube_pos_w=cube_pos_w,
+            place_pos_w=selected_target_pos_w,
+        )
         target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
 
         gripper_to_jaw_world = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
         gripper_to_jaw_local = quat_apply(quat_inv(current_gripper_quat_w), gripper_to_jaw_world)
         gripper_to_jaw = quat_apply(target_quat_w, gripper_to_jaw_local)
-
-        selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
 
         # DEBUG: report which phase is starting and the key positions involved (env 0 only) --
         # remove once the grasp/pose issues are resolved and confirmed fixed in sim.
@@ -346,7 +371,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             if step == boundary_step:
                 print(
                     f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
-                    f"cube_pos={cube_pos_w[0].tolist()} gripper_to_jaw={gripper_to_jaw[0].tolist()} "
+                    f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={ee_frame.data.target_pos_w[0, 1, :].tolist()} "
+                    f"gripper_to_jaw={gripper_to_jaw[0].tolist()} "
                     f"current_quat_w={current_gripper_quat_w[0].tolist()} "
                     f"target_quat_w={target_quat_w[0].tolist()} "
                     f"hold_pos_world={self._hold_pos_world[0].tolist() if self._hold_pos_world is not None else None} "
@@ -400,33 +426,58 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     # Orientation schedule
     # ------------------------------------------------------------------
 
-    def _target_orientation(self, step: int, current_gripper_quat_w: torch.Tensor) -> torch.Tensor:
+    def _top_down_quat(self, pos_w: torch.Tensor, robot_base_pos_w: torch.Tensor) -> torch.Tensor:
+        """Top-down orientation yawed toward ``pos_w`` as seen from the robot base.
+
+        The IK action drives only five joints (``shoulder_pan`` plus three pitch joints and
+        ``wrist_roll``) while the command is a full 6-DoF pose, so an orientation whose yaw does
+        not match the arm's own swing plane is unreachable and the solver trades away position
+        accuracy to chase it -- which is what made the gripper close on empty air. Rotating about
+        the world Z axis leaves the jaw pointing straight down while matching the heading
+        ``shoulder_pan`` produces, keeping the command inside the reachable set.
+        """
+        delta_yaw = _azimuth(pos_w, robot_base_pos_w) - self._grasp_azimuth_ref
+        delta_yaw = torch.atan2(torch.sin(delta_yaw), torch.cos(delta_yaw))  # wrap to [-pi, pi]
+        return quat_mul(_yaw_quat(delta_yaw), self._grasp_quat_world)
+
+    def _target_orientation(
+        self,
+        step: int,
+        current_gripper_quat_w: torch.Tensor,
+        robot_base_pos_w: torch.Tensor,
+        cube_pos_w: torch.Tensor,
+        place_pos_w: torch.Tensor,
+    ) -> torch.Tensor:
         """Return the world-space gripper orientation commanded at ``step``.
 
-        Picking the cube up and releasing it onto a marker both use the top-down orientation, so
-        the jaw descends onto the object rather than reaching in sideways. Only the mid-air hold
-        uses the middle orientation, and the episode ends back at the rest orientation.
+        Picking the cube up and releasing it onto a marker both use the top-down orientation
+        yawed toward that object, so the jaw descends onto it rather than reaching in sideways.
+        Only the mid-air hold uses the middle orientation, which is left exactly as calibrated so
+        the hold reproduces the middle pose, and the episode ends back at the rest orientation.
         """
-        if self._grasp_quat_world is None or self._hold_quat_world is None:
+        if self._grasp_quat_world is None or self._hold_quat_world is None or self._grasp_azimuth_ref is None:
             return current_gripper_quat_w
+
+        cube_quat = self._top_down_quat(cube_pos_w, robot_base_pos_w)
+        place_quat = self._top_down_quat(place_pos_w, robot_base_pos_w)
 
         if step < _APPROACH_STEPS:
             start_quat = (
                 self._initial_ee_quat_world if self._initial_ee_quat_world is not None else current_gripper_quat_w
             )
-            return _quat_nlerp(start_quat, self._grasp_quat_world, step / float(_APPROACH_STEPS))
+            return _quat_nlerp(start_quat, cube_quat, step / float(_APPROACH_STEPS))
         if step < _LIFT_CUBE_END:
-            return self._grasp_quat_world.clone()
+            return cube_quat
         if step < _MOVE_TO_MIDDLE_END:
             alpha = (step - _LIFT_CUBE_END) / float(_MOVE_TO_MIDDLE_END - _LIFT_CUBE_END)
-            return _quat_nlerp(self._grasp_quat_world, self._hold_quat_world, alpha)
+            return _quat_nlerp(cube_quat, self._hold_quat_world, alpha)
         if step < _HOLD_MIDDLE_END:
             return self._hold_quat_world.clone()
         if step < _MOVE_ABOVE_TARGET_END:
             alpha = (step - _HOLD_MIDDLE_END) / float(_MOVE_ABOVE_TARGET_END - _HOLD_MIDDLE_END)
-            return _quat_nlerp(self._hold_quat_world, self._grasp_quat_world, alpha)
+            return _quat_nlerp(self._hold_quat_world, place_quat, alpha)
         if step < _LIFT_GRIPPER_END:
-            return self._grasp_quat_world.clone()
+            return place_quat
         if self._rest_ee_quat_world is not None:
             return self._rest_ee_quat_world.clone()
         return current_gripper_quat_w
