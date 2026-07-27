@@ -117,20 +117,45 @@ class Data:
 
 
 class FakeRobot:
-    def __init__(self, truth):
+    """Analytic SO-101 stand-in that also reproduces the actuator pulling on a written pose.
+
+    ``write_joint_state_to_sim`` sets the joint state, but the physics step that follows drives the
+    joints towards the last *position target*. If the caller never writes that target it is still
+    all zeros, so the arm slides back out of the pose it was just placed in -- the bug that made
+    the real calibration measure a joint gain of 0.806 instead of 1.0. ``pullback`` is the largest
+    displacement one step can produce, i.e. the velocity limit times the physics timestep.
+    """
+
+    def __init__(self, truth, pullback=0.0):
         self.truth = truth
+        self.pullback = pullback
         self.data = Data()
         self.data.joint_names = list(JOINT_NAMES)
         self.data.joint_pos = torch.zeros(1, len(JOINT_NAMES), dtype=torch.float64)
         self.data.root_pos_w = torch.tensor([ROOT_POS], dtype=torch.float64)
         self.data.root_quat_w = torch.tensor([ROOT_QUAT], dtype=torch.float64)
         self.damping_history = []
+        self._target = None
 
     def write_joint_state_to_sim(self, position, velocity=None):
         self.data.joint_pos = position.clone()
 
+    def set_joint_position_target(self, target):
+        self._target = target.clone()
+
+    def write_data_to_sim(self):
+        pass
+
     def write_joint_damping_to_sim(self, damping):
         self.damping_history.append(damping)
+
+    def apply_physics_step(self):
+        if self.pullback <= 0.0:
+            return
+        target = self._target if self._target is not None else torch.zeros_like(self.data.joint_pos)
+        self.data.joint_pos = self.data.joint_pos + torch.clamp(
+            target - self.data.joint_pos, -self.pullback, self.pullback
+        )
 
     def jaw_world(self):
         pan, lift, elbow, wrist_flex = (float(self.data.joint_pos[0, i]) for i in range(4))
@@ -168,11 +193,11 @@ class FakeScene(dict):
 
 
 class FakeEnv:
-    def __init__(self, truth, cube_pos, nominal_cube_pos):
+    def __init__(self, truth, cube_pos, nominal_cube_pos, pullback=0.0):
         self.num_envs = 1
         self.device = "cpu"
         self.physics_dt = 1.0 / 60.0
-        robot = FakeRobot(truth)
+        robot = FakeRobot(truth, pullback=pullback)
         self.scene = FakeScene(
             robot=robot,
             ee_frame=FakeFrame(robot),
@@ -181,7 +206,7 @@ class FakeEnv:
             circle_target=FakeBody((nominal_cube_pos[0] - 0.18, nominal_cube_pos[1], nominal_cube_pos[2] - 0.018)),
         )
         self.scene.update()
-        self.sim = types.SimpleNamespace(step=lambda render=False: self.scene.update())
+        self.sim = types.SimpleNamespace(step=lambda render=False: (robot.apply_physics_step(), self.scene.update()))
         self.cfg = types.SimpleNamespace(
             scene=types.SimpleNamespace(
                 cube=types.SimpleNamespace(init_state=types.SimpleNamespace(pos=nominal_cube_pos))
@@ -203,7 +228,9 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
         pitch_signs=truth_signs,
     )
     nominal = (0.3460526111597802, -0.312, 0.056)
-    env = FakeEnv(truth, cube_pos, nominal)
+    # 10 rad/s velocity limit at a 60 Hz timestep -- the same order as the pull that broke the
+    # real calibration, so every run here exercises the pose-holding fix.
+    env = FakeEnv(truth, cube_pos, nominal, pullback=10.0 / 60.0)
     machine = lcpp.LiftCubePickPlaceStateMachine()
     machine.setup(env)
     robot = env.scene["robot"]

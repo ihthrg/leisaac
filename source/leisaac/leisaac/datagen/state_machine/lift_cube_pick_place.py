@@ -17,6 +17,9 @@ from .planar_arm_model import calibrate_planar_arm, wrap_to_pi
 
 _ARM_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
 
+_PROBE_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex")
+"""Joints the kinematic calibration solves for, in the order ``calibrate_planar_arm`` expects."""
+
 _GRIPPER_OPEN_RAD = 1.0
 _GRIPPER_CLOSE_RAD = 0.01
 """Gripper joint targets (rad). The closed value must stay below the ``0.26`` rad threshold that
@@ -57,6 +60,12 @@ the links did not end up at the intended pitches."""
 _CALIB_DELTA_DEG = 45.0
 """Probe displacement used to measure the kinematics. Large enough for well-conditioned circle
 fits, small enough to stay inside every joint limit from the all-zero probe pose."""
+
+_CALIB_RESIDUAL_WARN = 0.005
+"""Model-vs-measured disagreement (m) at the hold pose above which ``setup()`` warns loudly.
+
+The calibration is exact geometry, so anything beyond a millimetre or two means the probe poses
+were not measured cleanly and every jaw target inherits the error."""
 
 _JOINT_DAMPING = 3.0
 """Joint damping override (the asset default is 0.60, tuned for teleoperation).
@@ -245,9 +254,19 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             for idx, name in enumerate(joint_names):
                 joint_pos[:, idx] = math.radians(pose_deg.get(name, 0.0))
             robot.write_joint_state_to_sim(position=joint_pos, velocity=torch.zeros_like(joint_pos))
+            # Writing the joint *state* alone is not enough. The actuator keeps driving towards
+            # whatever position target was last written -- all zeros at start-up -- so the physics
+            # step below immediately drags the arm back out of the pose that was just written. In
+            # sim that cost about 9 deg of a 45 deg probe, which showed up as a joint gain of
+            # 0.806 instead of 1.0 and correctly aborted the calibration. Commanding the target
+            # too makes the step a no-op and the pose actually holds.
+            robot.set_joint_position_target(joint_pos)
+            robot.write_data_to_sim()
             env.sim.step(render=False)
             env.scene.update(dt=env.physics_dt)
             return joint_pos
+
+        probe_indices = [joint_names.index(name) for name in _PROBE_JOINT_NAMES]
 
         def probe(pan_deg: float, lift_deg: float, elbow_deg: float, wrist_flex_deg: float):
             write_pose({
@@ -260,7 +279,13 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             })
             jaw_pos_w = ee_frame.data.target_pos_w[:, 1, :]
             jaw_pos_b = quat_apply(quat_inv(robot.data.root_quat_w), jaw_pos_w - robot.data.root_pos_w)
-            return tuple(float(value) for value in jaw_pos_b[0])
+            # Report the angles the arm actually settled at, not the ones asked for, so the
+            # calibration stays exact even if a pose is held imperfectly.
+            achieved = robot.data.joint_pos[0, probe_indices]
+            return (
+                tuple(float(value) for value in jaw_pos_b[0]),
+                tuple(float(value) for value in achieved),
+            )
 
         self._model = calibrate_planar_arm(probe, delta_deg=_CALIB_DELTA_DEG)
 
@@ -281,7 +306,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         # DEBUG: report the measured model and check that the hold posture actually lands where the
         # model says it should -- remove together with the per-phase print once confirmed in sim.
-        measured = probe(0.0, math.degrees(hold_lift), math.degrees(hold_elbow), math.degrees(hold_wrist_flex))
+        measured = probe(0.0, math.degrees(hold_lift), math.degrees(hold_elbow), math.degrees(hold_wrist_flex))[0]
         predicted = self._model.jaw_in_plane(hold_lift, hold_elbow, hold_wrist_flex)
         residual = math.dist(self._model.to_plane(measured), predicted)
         self._rest_joint_pos = write_pose(_REST_POSE_DEG)
@@ -293,6 +318,12 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             f"height={predicted[1]:.4f} m, model-vs-measured residual={residual * 1000.0:.1f} mm, "
             f"center_x={self._center_x}"
         )
+        if residual > _CALIB_RESIDUAL_WARN:
+            print(
+                "[LiftCubePickPlace][setup] WARNING: the measured kinematics disagree with the robot by "
+                f"{residual * 1000.0:.1f} mm at the hold pose. Every jaw target will be off by roughly that "
+                "much; check that the calibration probes are being held steady."
+            )
 
     def check_success(self, env) -> bool:
         """Return True if the cube is on its correct target and the arm is at rest.
