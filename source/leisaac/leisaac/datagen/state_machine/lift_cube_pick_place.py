@@ -53,6 +53,29 @@ _GRASP_APPROACH_DIR_WORLD = (0.0, 0.0, -1.0)
 straight down makes the arm reach over the cube and close on it from above; these phases
 previously reused the middle pose's orientation, which approached the cube from the side."""
 
+_GRASP_REFERENCE_POSE_DEG = {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": 0.0,
+    "elbow_flex": 0.0,
+    "wrist_flex": 0.0,
+    "wrist_roll": 90.0,
+    "gripper": 0.0,
+}
+"""Joint pose FK-probed in ``setup()`` solely to derive the grasp/place orientation reference.
+
+This pose is never commanded. It exists so the grasp orientation is *independent of*
+``_MIDDLE_POSE_DEG``. The two used to share a single probe, which meant re-tuning the in-air hold
+silently rotated the grasp: dropping the hold's ``wrist_roll`` from 90 to 0 deg rolled the jaw by
+90 deg about the approach axis, so the fingers closed across a different axis of the cube.
+
+Two properties matter here, and both now come from this pose rather than from the hold pose:
+
+* ``wrist_roll`` fixes the jaw's roll about the vertical approach axis, i.e. which way the
+  fingers straddle the cube.
+* ``shoulder_pan`` at 0 with the arm extended puts the jaw unambiguously far out in front, so
+  the base-to-jaw azimuth is a well-conditioned reference heading for ``_top_down_quat`` (a
+  folded pose can put the jaw near the base, where that azimuth is noisy or flips by 180 deg)."""
+
 _REST_POSE_TOLERANCE_DEG = 30.0
 """Per-joint +/- tolerance (deg) used by ``_is_at_rest`` to decide if the arm reached
 ``_REST_POSE_DEG``. Matches the tolerance used by the shared
@@ -205,14 +228,17 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     # ------------------------------------------------------------------
 
     def setup(self, env) -> None:
-        """FK calibration for the rest and middle poses; other one-time setup.
+        """FK calibration for the rest, grasp-reference and middle poses; other one-time setup.
 
-        Teleports the joints to the SO-101 rest pose, then to the all-zero pose, then to the
-        requested middle pose (see ``_MIDDLE_POSE_DEG``), reading the corresponding world-space
-        gripper/jaw poses via FK. These are used as ordinary IK targets during the episode, so
+        Teleports the joints to each of ``_REST_POSE_DEG``, ``_GRASP_REFERENCE_POSE_DEG`` and
+        ``_MIDDLE_POSE_DEG`` in turn, reading the corresponding world-space gripper/jaw poses via
+        FK. The rest and middle results are used as ordinary IK targets during the episode, so
         the arm reaches them through smooth, physically-simulated motion rather than teleporting
-        while carrying the cube. The all-zero probe is only used to measure the arm's reach
-        heading (see ``_grasp_azimuth_ref`` below); it is never commanded.
+        while carrying the cube. The grasp-reference result only supplies the grasp orientation
+        and reference heading; that pose is never commanded.
+
+        Keeping the grasp reference on its own probe is what stops a change to the in-air hold
+        pose from rotating the grasp -- see ``_GRASP_REFERENCE_POSE_DEG``.
 
         The caller resets the environment after ``setup()``, so none of these calibration poses
         leak into the first recorded episode.
@@ -225,69 +251,65 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         state machine's target choice always agrees with the success-check's.
         """
         robot = env.scene["robot"]
-        joint_names = list(robot.data.joint_names)
-
-        self._rest_joint_pos = torch.zeros(env.num_envs, len(joint_names), device=env.device)
-        for idx, name in enumerate(joint_names):
-            if name in _REST_POSE_DEG:
-                self._rest_joint_pos[:, idx] = _REST_POSE_DEG[name] * torch.pi / 180.0
-
-        robot.write_joint_state_to_sim(
-            position=self._rest_joint_pos,
-            velocity=torch.zeros_like(self._rest_joint_pos),
-        )
-        env.sim.step(render=False)
-        env.scene.update(dt=env.physics_dt)
         # Use the ee_frame's "gripper" target (index 0, no offset) rather than
         # `robot.data.body_pos_w[:, -1, :]` -- the latter is whatever body happens to be *last*
         # in the articulation's body list, which is not guaranteed to be "gripper" if e.g. "jaw"
         # is a separate body ordered after it. This keeps every EE-space position in this file
         # anchored to the exact same, explicitly-named prim that the IK action also targets.
         ee_frame = env.scene["ee_frame"]
-        self._rest_ee_pos_world = ee_frame.data.target_pos_w[:, 0, :].clone()
-        self._rest_ee_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
+        joint_names = list(robot.data.joint_names)
 
-        # Reference heading for `_top_down_quat`: the horizontal direction the arm reaches when
-        # `shoulder_pan` is 0. Measured with a dedicated FK probe at the all-zero joint pose (a
-        # fully extended arm) instead of reusing the hold pose, so the reference stays valid
-        # whatever `_MIDDLE_POSE_DEG` is set to: a folded hold pose can put the jaw close to the
-        # base, where the base-to-jaw azimuth is ill-conditioned and can even flip by 180 deg.
-        # The extended arm puts the jaw unambiguously far out in front.
-        zero_joint_pos = torch.zeros_like(self._rest_joint_pos)
-        robot.write_joint_state_to_sim(
-            position=zero_joint_pos,
-            velocity=torch.zeros_like(zero_joint_pos),
-        )
-        env.sim.step(render=False)
-        env.scene.update(dt=env.physics_dt)
-        self._grasp_azimuth_ref = _azimuth(ee_frame.data.target_pos_w[:, 1, :], robot.data.root_pos_w)
+        def to_joint_pos(pose_deg: dict[str, float]) -> torch.Tensor:
+            joint_pos = torch.zeros(env.num_envs, len(joint_names), device=env.device)
+            for idx, name in enumerate(joint_names):
+                if name in pose_deg:
+                    joint_pos[:, idx] = pose_deg[name] * torch.pi / 180.0
+            return joint_pos
 
-        middle_joint_pos = torch.zeros_like(self._rest_joint_pos)
-        for idx, name in enumerate(joint_names):
-            if name in _MIDDLE_POSE_DEG:
-                middle_joint_pos[:, idx] = _MIDDLE_POSE_DEG[name] * torch.pi / 180.0
+        def fk_probe(pose_deg: dict[str, float]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """Teleport to ``pose_deg`` and return its (gripper_pos, gripper_quat, jaw_pos) in world."""
+            joint_pos = to_joint_pos(pose_deg)
+            robot.write_joint_state_to_sim(position=joint_pos, velocity=torch.zeros_like(joint_pos))
+            env.sim.step(render=False)
+            env.scene.update(dt=env.physics_dt)
+            return (
+                ee_frame.data.target_pos_w[:, 0, :].clone(),
+                ee_frame.data.target_quat_w[:, 0, :].clone(),
+                ee_frame.data.target_pos_w[:, 1, :].clone(),
+            )
 
-        robot.write_joint_state_to_sim(
-            position=middle_joint_pos,
-            velocity=torch.zeros_like(middle_joint_pos),
-        )
-        env.sim.step(render=False)
-        env.scene.update(dt=env.physics_dt)
-        self._hold_pos_world = ee_frame.data.target_pos_w[:, 1, :].clone()
-        self._hold_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
+        self._rest_joint_pos = to_joint_pos(_REST_POSE_DEG)
+        self._rest_ee_pos_world, self._rest_ee_quat_world, _ = fk_probe(_REST_POSE_DEG)
 
-        # Top-down grasp orientation: rotate the middle orientation by the shortest arc that
-        # brings its gripper-to-jaw axis onto straight down, so the jaw closes on the cube from
-        # above while otherwise staying as close to the middle orientation as possible.
-        middle_approach_dir = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
-        down_dir = torch.tensor(_GRASP_APPROACH_DIR_WORLD, device=env.device).expand_as(middle_approach_dir)
-        self._grasp_quat_world = quat_mul(
-            _quat_between_vectors(middle_approach_dir, down_dir),
-            self._hold_quat_world,
-        )
+        # Grasp/place orientation and reference heading, derived from a dedicated probe so they
+        # stay fixed no matter how `_MIDDLE_POSE_DEG` is tuned. The orientation rotates the
+        # probe's orientation by the shortest arc that brings its gripper-to-jaw axis onto
+        # straight down, so the jaw closes on the cube from above.
+        ref_gripper_pos, ref_gripper_quat, ref_jaw_pos = fk_probe(_GRASP_REFERENCE_POSE_DEG)
+        approach_dir = ref_jaw_pos - ref_gripper_pos
+        down_dir = torch.tensor(_GRASP_APPROACH_DIR_WORLD, device=env.device).expand_as(approach_dir)
+        self._grasp_quat_world = quat_mul(_quat_between_vectors(approach_dir, down_dir), ref_gripper_quat)
+        self._grasp_azimuth_ref = _azimuth(ref_jaw_pos, robot.data.root_pos_w)
+
+        # In-air hold target. Only this phase uses the middle pose.
+        _, self._hold_quat_world, self._hold_pos_world = fk_probe(_MIDDLE_POSE_DEG)
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
+
+        # DEBUG: dump the FK-calibrated references (env 0 only) -- remove together with the
+        # per-phase print in get_action() once the poses are confirmed correct in sim.
+        print(
+            f"[LiftCubePickPlace][setup] robot_base_pos={robot.data.root_pos_w[0].tolist()} "
+            f"rest_gripper_pos={self._rest_ee_pos_world[0].tolist()} "
+            f"grasp_ref_jaw_pos={ref_jaw_pos[0].tolist()} "
+            f"grasp_ref_approach_dir={approach_dir[0].tolist()} "
+            f"grasp_quat_world={self._grasp_quat_world[0].tolist()} "
+            f"grasp_azimuth_ref_deg={float(self._grasp_azimuth_ref[0]) * 180.0 / torch.pi:.1f} "
+            f"hold_jaw_pos={self._hold_pos_world[0].tolist()} "
+            f"hold_quat_world={self._hold_quat_world[0].tolist()} "
+            f"center_x={self._center_x}"
+        )
 
     def check_success(self, env) -> bool:
         """Return True if the cube is on its correct target and the arm is at rest.
