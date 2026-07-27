@@ -26,8 +26,8 @@ _REST_POSE_DEG = {
 
 _MIDDLE_POSE_DEG = {
     "shoulder_pan": 0.0,  # J1: facing front (centered)
-    "shoulder_lift": 90.0,  # J2: upper arm raised to vertical
-    "elbow_flex": -90.0,  # J3: forearm back down to horizontal, pointing forward
+    "shoulder_lift": -16.4,  # J2: upper arm vertical
+    "elbow_flex": 15.7,  # J3: forearm horizontal, pointing forward
     "wrist_flex": 0.0,  # J4: gripper in line with the forearm
     "wrist_roll": 0.0,  # J5: straight (centered)
     "gripper": 0.0,  # J6 (overridden by the binary gripper command while holding)
@@ -35,22 +35,32 @@ _MIDDLE_POSE_DEG = {
 """Joint pose used as the in-air hold target ("middle position").
 
 Reproduces the requested reference posture: an L shape with the **upper arm vertical** and the
-**forearm horizontal, pointing forward**, gripper in line with the forearm.
+**forearm horizontal, pointing forward**.
 
-The angles follow from the all-zero configuration being an arm stretched straight out in front of
-the robot, with positive ``shoulder_lift``/``elbow_flex`` both rotating their link upward:
+These angles are not guessed -- they are solved from the arm's real kinematics. Five
+(``shoulder_lift``, ``elbow_flex``) pairs were FK-probed in sim and their jaw positions fitted to
+a planar two-link model, which reproduced all five to 3.2 mm RMS and recovered ``L1 = 0.1159 m``,
+matching the SO-101's actual upper-arm length. In that model the link pitches (measured from
+horizontal-forward, positive up) are::
 
-* ``shoulder_lift`` +90 raises the upper arm from horizontal-forward to vertical.
-* ``elbow_flex`` -90 brings the forearm back down to horizontal, so its absolute pitch is
-  ``shoulder_lift + elbow_flex`` = 0.
+    upper arm = 73.6 - shoulder_lift
+    forearm   = upper arm + 285.7 - elbow_flex
 
-The same model reproduces ``_REST_POSE_DEG``: at ``shoulder_lift`` -100 / ``elbow_flex`` +90 the
-forearm sits at -10 deg, i.e. nearly horizontal just above the table, which is the compact folded
-rest posture. If the arm comes out mirrored in sim, negate both angles together -- their sum must
-stay at 0 to keep the forearm horizontal.
+Setting the upper arm to +90 deg and the forearm to 0 deg gives the angles above. The model also
+explains why the two poses tried before both looked stretched out: measured as distance from the
+shoulder, with 0.406 m being full extension,
 
-Being bent also keeps the pose well away from the fully-extended configuration, a kinematic
-singularity where the differential-IK solver used by this task loses a DoF and converges poorly."""
+===========================  ==========  ===========  ============
+pose                         upper arm   forearm      distance
+===========================  ==========  ===========  ============
+all joints 0                 +73.6 deg   -0.7 deg     0.340 m
+shoulder_lift 90/elbow -90   -16.4 deg   -0.7 deg     0.402 m
+this pose                    +90.0 deg   +0.0 deg     0.312 m
+===========================  ==========  ===========  ============
+
+Both earlier poses left the forearm collinear with the upper arm, the second at 99% of full
+extension. Bending the elbow also keeps the pose away from that fully-extended configuration,
+which is a kinematic singularity where the differential-IK solver loses a DoF."""
 
 _GRASP_APPROACH_DIR_WORLD = (0.0, 0.0, -1.0)
 """World direction the gripper-to-jaw axis must point while grasping and placing. Pointing it
@@ -106,29 +116,29 @@ A small bias so the fingers straddle the cube rather than grazing its top face. 
 the whole burden of the controller's tracking error; that is now handled by the closed-loop
 correction below, so this stays small enough to keep the jaw ~1 cm clear of the table."""
 
-_JAW_CORRECTION_GAIN = 0.8
-_JAW_CORRECTION_LIMIT = 0.04
-_JAW_TARGET_STATIC_EPS = 0.001
+_JAW_CORRECTION_GAIN = 0.15
+_JAW_CORRECTION_LIMIT = 0.03
 """Outer-loop correction on the commanded jaw position.
 
 The differential-IK action is over-constrained -- five joints tracking a 6-DoF pose -- so its
 least-squares solution settles wherever the position and orientation errors balance, leaving a
 *steady-state* position error that no amount of extra settling time removes. Measured in sim: the
 jaw stopped 2.6 cm short of its commanded point after two full seconds of descending onto a
-stationary cube, and the gripper closed on air.
+stationary cube, and the gripper closed on air. So the commanded target is corrected by an
+integral of the observed jaw error, which drives that offset to zero regardless of its source.
 
-So the commanded target is corrected by an integral of the observed jaw error, which drives that
-steady-state offset to zero regardless of where it comes from:
+The correction is only ever integrated *and applied* while a phase holds its target still (see
+``_PHASE_TARGET_IS_STATIC`` at the call site), and it is reset whenever a moving phase runs. The
+first attempt instead inferred "static" from a per-step movement threshold, and the sim log shows
+why that failed: the approach phase interpolates 0.137 m over 180 steps, i.e. 0.76 mm/step, which
+slipped under the 1 mm threshold. The correction therefore wound up during the approach and
+dragged the command 4 cm sideways, leaving the jaw 12 cm off target when the descent began.
 
-* ``_JAW_CORRECTION_GAIN`` was chosen by simulating this loop around a first-order plant with the
-  measured 2.6 cm offset. It settles under 6 mm within the 120-step descend phase for every inner
-  loop time constant from 10 to 120 steps, and never overshoots the initial error -- unlike
-  smaller gains, which are only well behaved for a narrow band of lags.
-* ``_JAW_CORRECTION_LIMIT`` bounds the correction, so a genuinely unreachable target (or a jaw
-  blocked by the table) degrades into a bounded offset instead of winding up.
-* Integration only runs while the commanded target is stationary to within
-  ``_JAW_TARGET_STATIC_EPS``; during the interpolated transit phases the error is dominated by
-  ordinary tracking lag, which must not be integrated."""
+The gain is also far lower than the first attempt's 0.8, which multiplied the approach's ~10 cm
+error into an 8 cm step and slammed the clamp within a single step; the log shows it then
+oscillating rail to rail (``[+0.04, +0.04, ...]`` then ``[+0.04, -0.04, -0.04]``). At 0.15 a
+typical 1.5 cm residual moves the correction ~2 mm per step, converging well inside the 120-step
+descend phase without ever approaching the clamp."""
 
 # Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim
 # tick, so a 60Hz simulation (`--step_hz 60`) requires `round(seconds * 60)` steps for the
@@ -261,7 +271,6 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._grasp_quat_world: torch.Tensor | None = None
         self._grasp_azimuth_ref: torch.Tensor | None = None
         self._jaw_correction: torch.Tensor | None = None
-        self._last_jaw_target: torch.Tensor | None = None
         self._center_x: float = 0.0
         self._target_is_circle: torch.Tensor | None = None
 
@@ -338,28 +347,6 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
-
-        # DEBUG: FK-probe candidate middle poses and report the resulting jaw geometry relative
-        # to the robot base, so the (shoulder_lift, elbow_flex) sign convention can be read off
-        # from measured geometry rather than guessed. The requested posture (upper arm vertical,
-        # forearm horizontal) is the candidate with a small horizontal reach and a clearly
-        # positive height; a fully extended arm shows the largest horizontal reach.
-        # Remove once the middle pose is confirmed in sim.
-        base_pos_w = robot.data.root_pos_w
-        for lift, flex in ((0.0, 0.0), (90.0, -90.0), (90.0, 90.0), (-90.0, 90.0), (-90.0, -90.0)):
-            candidate = dict(_MIDDLE_POSE_DEG)
-            candidate["shoulder_lift"] = lift
-            candidate["elbow_flex"] = flex
-            _, _, candidate_jaw = fk_probe(candidate)
-            rel = (candidate_jaw - base_pos_w)[0]
-            print(
-                f"[LiftCubePickPlace][setup] candidate shoulder_lift={lift:+.0f} elbow_flex={flex:+.0f}"
-                f" -> jaw_rel_base={rel.tolist()}"
-                f" horizontal_reach={float(torch.linalg.vector_norm(rel[:2])):.3f}"
-                f" height={float(rel[2]):+.3f}"
-            )
-        # Restore the calibration that the episode actually uses.
-        _, self._hold_quat_world, self._hold_pos_world = fk_probe(_MIDDLE_POSE_DEG)
 
         # DEBUG: dump the FK-calibrated references (env 0 only) -- remove together with the
         # per-phase print in get_action() once the poses are confirmed correct in sim.
@@ -466,7 +453,6 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             self._initial_ee_quat_world = current_gripper_quat_w.clone()
             self._target_is_circle = cube_pos_w[:, 0] > self._center_x
             self._jaw_correction = torch.zeros(num_envs, 3, device=device)
-            self._last_jaw_target = None
 
         selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
 
@@ -502,59 +488,69 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         if step < _APPROACH_STEPS:
             jaw_target_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, num_envs, device)
+            target_is_static = False
         elif step < _LOWER_TO_CUBE_END:
             jaw_target_w, gripper_cmd = self._phase_lower_to_cube(cube_pos_w, num_envs, device)
+            target_is_static = True
         elif step < _GRASP_END:
             jaw_target_w, gripper_cmd = self._phase_grasp(cube_pos_w, num_envs, device)
+            target_is_static = True
         elif step < _LIFT_CUBE_END:
             jaw_target_w, gripper_cmd = self._phase_lift_cube(cube_pos_w, num_envs, device)
+            target_is_static = True
         elif step < _MOVE_TO_MIDDLE_END:
             jaw_target_w, gripper_cmd = self._phase_move_to_middle(cube_pos_w, num_envs, device)
+            target_is_static = False
         elif step < _HOLD_MIDDLE_END:
             jaw_target_w, gripper_cmd = self._phase_hold_middle(num_envs, device)
+            target_is_static = True
         elif step < _MOVE_ABOVE_TARGET_END:
             jaw_target_w, gripper_cmd = self._phase_move_above_target(selected_target_pos_w, num_envs, device)
+            target_is_static = False
         elif step < _LOWER_TO_TARGET_END:
             jaw_target_w, gripper_cmd = self._phase_lower_to_target(selected_target_pos_w, num_envs, device)
+            target_is_static = True
         elif step < _RELEASE_END:
             jaw_target_w, gripper_cmd = self._phase_release(selected_target_pos_w, num_envs, device)
+            target_is_static = True
         elif step < _LIFT_GRIPPER_END:
             jaw_target_w, gripper_cmd = self._phase_lift_gripper(selected_target_pos_w, num_envs, device)
+            target_is_static = True
         else:
             jaw_target_w = None
             pos_w, gripper_cmd = self._phase_return_home(num_envs, device)
 
         if jaw_target_w is not None:
-            pos_w = jaw_target_w + self._update_jaw_correction(jaw_target_w, jaw_pos_w) - gripper_to_jaw
+            pos_w = (
+                jaw_target_w + self._update_jaw_correction(jaw_target_w, jaw_pos_w, target_is_static) - gripper_to_jaw
+            )
         else:
             # Return-home is commanded directly in the gripper frame, and ``pre_step`` drives the
             # joints to the rest pose anyway, so the correction neither applies nor carries over.
-            self._last_jaw_target = None
+            self._jaw_correction = None
 
         diff_w = pos_w - robot_base_pos_w
         target_pos_local = quat_apply(quat_inv(robot_base_quat_w), diff_w)
         return torch.cat([target_pos_local, target_quat, gripper_cmd], dim=-1)
 
-    def _update_jaw_correction(self, jaw_target_w: torch.Tensor, jaw_pos_w: torch.Tensor) -> torch.Tensor:
-        """Integrate the jaw tracking error while the commanded target is stationary.
+    def _update_jaw_correction(
+        self, jaw_target_w: torch.Tensor, jaw_pos_w: torch.Tensor, target_is_static: bool
+    ) -> torch.Tensor:
+        """Integrate the jaw tracking error, but only while the phase holds its target still.
 
-        See ``_JAW_CORRECTION_GAIN`` for why this outer loop is needed at all. Integrating only
-        against a stationary target keeps ordinary transit lag -- which is not an error to be
-        cancelled -- out of the accumulator.
+        See ``_JAW_CORRECTION_GAIN`` for why this outer loop exists and why it must stay off
+        during the interpolated phases: there the error is dominated by ordinary transit lag,
+        which is not an offset to be cancelled. Those phases also reset the accumulator, so every
+        static phase starts from zero and cannot inherit a stale bias from the previous one.
         """
+        if not target_is_static:
+            self._jaw_correction = torch.zeros_like(jaw_target_w)
+            return self._jaw_correction
         if self._jaw_correction is None:
             self._jaw_correction = torch.zeros_like(jaw_target_w)
-        if self._last_jaw_target is not None:
-            target_moved = torch.linalg.vector_norm(jaw_target_w - self._last_jaw_target, dim=-1, keepdim=True)
-            error = self._last_jaw_target - jaw_pos_w
-            self._jaw_correction = torch.where(
-                target_moved < _JAW_TARGET_STATIC_EPS,
-                (self._jaw_correction + _JAW_CORRECTION_GAIN * error).clamp(
-                    -_JAW_CORRECTION_LIMIT, _JAW_CORRECTION_LIMIT
-                ),
-                self._jaw_correction,
-            )
-        self._last_jaw_target = jaw_target_w.clone()
+        self._jaw_correction = (self._jaw_correction + _JAW_CORRECTION_GAIN * (jaw_target_w - jaw_pos_w)).clamp(
+            -_JAW_CORRECTION_LIMIT, _JAW_CORRECTION_LIMIT
+        )
         return self._jaw_correction
 
     def advance(self) -> None:
@@ -572,7 +568,6 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._initial_ee_quat_world = None
         self._home_start_pos = None
         self._jaw_correction = None
-        self._last_jaw_target = None
         self._target_is_circle = None
 
     # ------------------------------------------------------------------
