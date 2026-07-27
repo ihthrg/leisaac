@@ -214,7 +214,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     def setup(self, env) -> None:
         """Measure the arm's kinematics, then solve the fixed poses the episode is built from.
 
-        Nine forward-kinematics probes pin down every parameter in closed form, because sweeping
+        Ten forward-kinematics probes pin down every parameter in closed form, because sweeping
         one joint sends the jaw around a circle centred on that joint (see
         ``planar_arm_model.calibrate_planar_arm``). Measuring beats hard-coding here: the link
         lengths and joint-angle offsets that come out of this are exactly the quantities earlier
@@ -222,12 +222,14 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         Two details of the probe pose matter and are easy to get wrong:
 
-        * ``wrist_roll`` and the gripper both move the jaw frame, so both are held at the values
-          used during the episode. Calibrating with the gripper closed is deliberate -- that is
-          the point where the fingers meet, so aiming *it* at the cube while the fingers are still
-          open makes them straddle the cube and close on it.
-        * The caller resets the environment after ``setup()``, so none of these probe poses leak
-          into the first recorded episode.
+        * ``wrist_roll`` moves the jaw frame, so it is held at the value used during the episode.
+        * Only one of the SO-101's fingers moves, so the jaw frame Isaac Sim reports swings a long
+          way as the gripper opens. The tenth probe repeats the reference pose with the jaws open
+          so the model can track the midpoint between the fingertips; aiming the closed position
+          at a cube instead puts the *stationary* finger where the cube is and shoves it aside.
+
+        The caller resets the environment after ``setup()``, so none of these probe poses leak
+        into the first recorded episode.
 
         ``center_x`` (the left/right decision threshold) is derived from the cube's *nominal*
         (pre-randomisation) spawn point, i.e. ``env.cfg.scene.cube.init_state.pos`` -- the same
@@ -268,14 +270,14 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         probe_indices = [joint_names.index(name) for name in _PROBE_JOINT_NAMES]
 
-        def probe(pan_deg: float, lift_deg: float, elbow_deg: float, wrist_flex_deg: float):
+        def probe(pan_deg: float, lift_deg: float, elbow_deg: float, wrist_flex_deg: float, gripper_deg: float):
             write_pose({
                 "shoulder_pan": pan_deg,
                 "shoulder_lift": lift_deg,
                 "elbow_flex": elbow_deg,
                 "wrist_flex": wrist_flex_deg,
                 "wrist_roll": _WRIST_ROLL_DEG,
-                "gripper": math.degrees(_GRIPPER_CLOSE_RAD),
+                "gripper": gripper_deg,
             })
             jaw_pos_w = ee_frame.data.target_pos_w[:, 1, :]
             jaw_pos_b = quat_apply(quat_inv(robot.data.root_quat_w), jaw_pos_w - robot.data.root_pos_w)
@@ -287,7 +289,12 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
                 tuple(float(value) for value in achieved),
             )
 
-        self._model = calibrate_planar_arm(probe, delta_deg=_CALIB_DELTA_DEG)
+        self._model = calibrate_planar_arm(
+            probe,
+            delta_deg=_CALIB_DELTA_DEG,
+            gripper_closed_deg=math.degrees(_GRIPPER_CLOSE_RAD),
+            gripper_open_deg=math.degrees(_GRIPPER_OPEN_RAD),
+        )
 
         hold_lift, hold_elbow, hold_wrist_flex = self._model.joints_for_link_pitches(*_HOLD_LINK_PITCHES_DEG)
         self._hold_arm = self._arm_command(
@@ -306,7 +313,10 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         # DEBUG: report the measured model and check that the hold posture actually lands where the
         # model says it should -- remove together with the per-phase print once confirmed in sim.
-        measured = probe(0.0, math.degrees(hold_lift), math.degrees(hold_elbow), math.degrees(hold_wrist_flex))[0]
+        hold_deg = (0.0, math.degrees(hold_lift), math.degrees(hold_elbow), math.degrees(hold_wrist_flex))
+        closed_tip = probe(*hold_deg, math.degrees(_GRIPPER_CLOSE_RAD))[0]
+        open_tip = probe(*hold_deg, math.degrees(_GRIPPER_OPEN_RAD))[0]
+        measured = tuple(0.5 * (a + b) for a, b in zip(closed_tip, open_tip))
         predicted = self._model.jaw_in_plane(hold_lift, hold_elbow, hold_wrist_flex)
         residual = math.dist(self._model.to_plane(measured), predicted)
         self._rest_joint_pos = write_pose(_REST_POSE_DEG)
@@ -370,9 +380,10 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     def get_action(self, env) -> torch.Tensor:
         """Compute the action for the current step: five arm joint angles plus the gripper.
 
-        Cube and target positions describe where the *jaw* should be -- the point where the fingers
-        meet, i.e. ``ee_frame``'s second target frame with the gripper closed, which is what the
-        kinematic model was calibrated against.
+        Cube and target positions describe where the *grasp centre* should be -- the point midway
+        between the two fingertips with the jaws open, which is what the kinematic model tracks.
+        Only one finger moves on this arm, so that is a very different place from the jaw frame
+        Isaac Sim reports.
 
         Phases either hold a solved configuration or ease between two of them, so consecutive
         phases always agree at their shared boundary and the commanded joint velocity is zero

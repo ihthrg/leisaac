@@ -110,6 +110,13 @@ def _load_state_machine():
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 ROOT_POS = (0.35, -0.64, 0.01)
 ROOT_QUAT = (0.0, 0.0, 0.0, 1.0)  # 180 deg about Z, matching the asset config
+FINGER_SWING_PER_RAD = 0.9
+"""How far the reported jaw frame rotates about the wrist per radian of gripper opening.
+
+Only one SO-101 finger moves, so the frame Isaac Sim reports swings a long way -- about 8 cm
+between the closed and open commands in the real run. This reproduces that, which is what makes
+the harness able to catch aiming at the stationary finger instead of the middle of the jaws.
+"""
 
 
 class Data:
@@ -157,9 +164,19 @@ class FakeRobot:
             target - self.data.joint_pos, -self.pullback, self.pullback
         )
 
-    def jaw_world(self):
+    def jaw_world(self, gripper=None):
+        """World position of the reported jaw frame, which moves with the gripper opening."""
         pan, lift, elbow, wrist_flex = (float(self.data.joint_pos[0, i]) for i in range(4))
-        forward, height = self.truth.jaw_in_plane(lift, elbow, wrist_flex)
+        if gripper is None:
+            gripper = float(self.data.joint_pos[0, 5])
+        pitch1, pitch2, pitch3 = self.truth.pitches_from_joints(lift, elbow, wrist_flex)
+        length1, length2, length3 = self.truth.lengths
+        wrist_f = self.truth.shoulder[0] + length1 * math.cos(pitch1) + length2 * math.cos(pitch2)
+        wrist_h = self.truth.shoulder[1] + length1 * math.sin(pitch1) + length2 * math.sin(pitch2)
+        tip_pitch = pitch3 + FINGER_SWING_PER_RAD * gripper
+        forward = wrist_f + length3 * math.cos(tip_pitch)
+        height = wrist_h + length3 * math.sin(tip_pitch)
+
         ux, uy = self.truth.plane_dir
         px, py = -uy, ux
         hx = self.truth.pan_axis[0] + forward * ux + self.truth.plane_offset * px
@@ -169,6 +186,10 @@ class FakeRobot:
         by = math.sin(angle) * hx + math.cos(angle) * hy
         base = torch.tensor([[bx, by, height]], dtype=torch.float64)
         return _quat_apply(self.data.root_quat_w, base) + self.data.root_pos_w
+
+    def grasp_center_world(self, closed, open_):
+        """Midpoint of the two fingertips: where an object has to be to end up between them."""
+        return 0.5 * (self.jaw_world(closed) + self.jaw_world(open_))
 
 
 class FakeFrame:
@@ -248,6 +269,10 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     release_target = env.scene["target" if cube_pos[0] <= nominal[0] else "circle_target"].data.root_pos_w[
         0
     ] + torch.tensor([0.0, 0.0, lcpp._RELEASE_CLEARANCE], dtype=torch.float64)
+
+    def grasp_center():
+        return robot.grasp_center_world(lcpp._GRIPPER_CLOSE_RAD, lcpp._GRIPPER_OPEN_RAD)
+
     while not machine.is_episode_done:
         machine.pre_step(env)
         action = machine.get_action(env)
@@ -273,9 +298,9 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
             hover_tilt = abs(pitches[2] + 90.0)
         if step == lcpp._GRASP_END - 1:
             grasp_tilt = abs(pitches[2] + 90.0)
-            grasp_error = float(torch.linalg.vector_norm(robot.jaw_world()[0] - grasp_target))
+            grasp_error = float(torch.linalg.vector_norm(grasp_center()[0] - grasp_target))
         if step == lcpp._RELEASE_END - 1:
-            release_error = float(torch.linalg.vector_norm(robot.jaw_world()[0] - release_target))
+            release_error = float(torch.linalg.vector_norm(grasp_center()[0] - release_target))
         if step == lcpp._HOLD_MIDDLE_END - 1:
             hold_pitches = pitches
         machine.advance()
@@ -289,8 +314,9 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
 
     release_reachable = reachable(release_target.unsqueeze(0))
     print(
-        f"{label}: grasp jaw error = {grasp_error * 1000:.4f} mm | release jaw error = "
+        f"{label}: grasp centre error = {grasp_error * 1000:.4f} mm | release centre error = "
         f"{release_error * 1000:.4f} mm ({'in' if release_reachable else 'OUT OF'} reach) | "
+        f"jaw span = {machine._model.grasp_span * 1000:.1f} mm | "
         f"hold link pitches = {[round(v, 3) for v in hold_pitches]} deg | "
         f"gripper tilt off vertical: hover {hover_tilt:.2f} deg, grasp {grasp_tilt:.2f} deg | "
         f"max per-step joint change = {math.degrees(max_jump):.2f} deg | damping = {robot.damping_history[0]}"
