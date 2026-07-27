@@ -99,17 +99,36 @@ _HOVER_CLEARANCE = 0.10
 _RELEASE_CLEARANCE = 0.02
 """Jaw height (m) above the target marker when lowering to release the cube."""
 
-_GRASP_DEPTH_BELOW_CENTER = 0.01
+_GRASP_DEPTH_BELOW_CENTER = 0.005
 """How far (m) *below* the cube's centre the jaw is commanded while descending and grasping.
 
-The damped-least-squares IK converges asymptotically and is additionally over-constrained here
-(5 joints tracking a 6-DoF pose), so the jaw always stops slightly short of its commanded target.
-Aiming for the exact centre therefore leaves the fingers hovering just above the cube and closing
-on air. Over-commanding along the approach direction absorbs that residual.
+A small bias so the fingers straddle the cube rather than grazing its top face. It used to carry
+the whole burden of the controller's tracking error; that is now handled by the closed-loop
+correction below, so this stays small enough to keep the jaw ~1 cm clear of the table."""
 
-The cube is 3 cm, so its centre is 1.5 cm above the table: at 1 cm this target still sits inside
-the cube, and even if the IK converged perfectly the fingers would straddle the lower half of the
-cube rather than pushing into the table."""
+_JAW_CORRECTION_GAIN = 0.8
+_JAW_CORRECTION_LIMIT = 0.04
+_JAW_TARGET_STATIC_EPS = 0.001
+"""Outer-loop correction on the commanded jaw position.
+
+The differential-IK action is over-constrained -- five joints tracking a 6-DoF pose -- so its
+least-squares solution settles wherever the position and orientation errors balance, leaving a
+*steady-state* position error that no amount of extra settling time removes. Measured in sim: the
+jaw stopped 2.6 cm short of its commanded point after two full seconds of descending onto a
+stationary cube, and the gripper closed on air.
+
+So the commanded target is corrected by an integral of the observed jaw error, which drives that
+steady-state offset to zero regardless of where it comes from:
+
+* ``_JAW_CORRECTION_GAIN`` was chosen by simulating this loop around a first-order plant with the
+  measured 2.6 cm offset. It settles under 6 mm within the 120-step descend phase for every inner
+  loop time constant from 10 to 120 steps, and never overshoots the initial error -- unlike
+  smaller gains, which are only well behaved for a narrow band of lags.
+* ``_JAW_CORRECTION_LIMIT`` bounds the correction, so a genuinely unreachable target (or a jaw
+  blocked by the table) degrades into a bounded offset instead of winding up.
+* Integration only runs while the commanded target is stationary to within
+  ``_JAW_TARGET_STATIC_EPS``; during the interpolated transit phases the error is dominated by
+  ordinary tracking lag, which must not be integrated."""
 
 # Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim
 # tick, so a 60Hz simulation (`--step_hz 60`) requires `round(seconds * 60)` steps for the
@@ -231,6 +250,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._step_count: int = 0
         self._episode_done: bool = False
         self._initial_ee_pos: torch.Tensor | None = None
+        self._initial_jaw_pos: torch.Tensor | None = None
         self._initial_ee_quat_world: torch.Tensor | None = None
         self._rest_ee_pos_world: torch.Tensor | None = None
         self._rest_ee_quat_world: torch.Tensor | None = None
@@ -240,6 +260,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._hold_quat_world: torch.Tensor | None = None
         self._grasp_quat_world: torch.Tensor | None = None
         self._grasp_azimuth_ref: torch.Tensor | None = None
+        self._jaw_correction: torch.Tensor | None = None
+        self._last_jaw_target: torch.Tensor | None = None
         self._center_x: float = 0.0
         self._target_is_circle: torch.Tensor | None = None
 
@@ -317,6 +339,28 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
 
+        # DEBUG: FK-probe candidate middle poses and report the resulting jaw geometry relative
+        # to the robot base, so the (shoulder_lift, elbow_flex) sign convention can be read off
+        # from measured geometry rather than guessed. The requested posture (upper arm vertical,
+        # forearm horizontal) is the candidate with a small horizontal reach and a clearly
+        # positive height; a fully extended arm shows the largest horizontal reach.
+        # Remove once the middle pose is confirmed in sim.
+        base_pos_w = robot.data.root_pos_w
+        for lift, flex in ((0.0, 0.0), (90.0, -90.0), (90.0, 90.0), (-90.0, 90.0), (-90.0, -90.0)):
+            candidate = dict(_MIDDLE_POSE_DEG)
+            candidate["shoulder_lift"] = lift
+            candidate["elbow_flex"] = flex
+            _, _, candidate_jaw = fk_probe(candidate)
+            rel = (candidate_jaw - base_pos_w)[0]
+            print(
+                f"[LiftCubePickPlace][setup] candidate shoulder_lift={lift:+.0f} elbow_flex={flex:+.0f}"
+                f" -> jaw_rel_base={rel.tolist()}"
+                f" horizontal_reach={float(torch.linalg.vector_norm(rel[:2])):.3f}"
+                f" height={float(rel[2]):+.3f}"
+            )
+        # Restore the calibration that the episode actually uses.
+        _, self._hold_quat_world, self._hold_pos_world = fk_probe(_MIDDLE_POSE_DEG)
+
         # DEBUG: dump the FK-calibrated references (env 0 only) -- remove together with the
         # per-phase print in get_action() once the poses are confirmed correct in sim.
         print(
@@ -391,6 +435,9 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         using the current world-space offset is only correct when current and target
         orientations already match.
 
+        Every jaw target additionally passes through ``_update_jaw_correction()``, which cancels
+        the over-constrained IK's steady-state position error (see ``_JAW_CORRECTION_GAIN``).
+
         The target orientation is scheduled per phase by ``_target_orientation()``: grasping and
         placing point the jaw straight down and yaw it toward whichever object is being reached,
         the mid-air hold uses the middle orientation, and return-home restores the rest
@@ -411,11 +458,15 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         ee_frame = env.scene["ee_frame"]
         current_gripper_quat_w = ee_frame.data.target_quat_w[:, 0, :].clone()
+        jaw_pos_w = ee_frame.data.target_pos_w[:, 1, :].clone()
 
         if step == 0:
             self._initial_ee_pos = ee_frame.data.target_pos_w[:, 0, :].clone()
+            self._initial_jaw_pos = ee_frame.data.target_pos_w[:, 1, :].clone()
             self._initial_ee_quat_world = current_gripper_quat_w.clone()
             self._target_is_circle = cube_pos_w[:, 0] > self._center_x
+            self._jaw_correction = torch.zeros(num_envs, 3, device=device)
+            self._last_jaw_target = None
 
         selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
 
@@ -436,11 +487,11 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         # remove once the grasp/pose issues are resolved and confirmed fixed in sim.
         for boundary_step, phase_name in _PHASE_START_NAMES:
             if step == boundary_step:
-                jaw_pos = ee_frame.data.target_pos_w[0, 1, :]
                 print(
                     f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
-                    f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={jaw_pos.tolist()} "
-                    f"jaw_minus_cube={(jaw_pos - cube_pos_w[0]).tolist()} "
+                    f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={jaw_pos_w[0].tolist()} "
+                    f"jaw_minus_cube={(jaw_pos_w[0] - cube_pos_w[0]).tolist()} "
+                    f"jaw_correction={self._jaw_correction[0].tolist() if self._jaw_correction is not None else None} "
                     f"gripper_to_jaw={gripper_to_jaw[0].tolist()} "
                     f"current_quat_w={current_gripper_quat_w[0].tolist()} "
                     f"target_quat_w={target_quat_w[0].tolist()} "
@@ -450,31 +501,61 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
                 break
 
         if step < _APPROACH_STEPS:
-            pos_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, num_envs, device)
         elif step < _LOWER_TO_CUBE_END:
-            pos_w, gripper_cmd = self._phase_lower_to_cube(cube_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_lower_to_cube(cube_pos_w, num_envs, device)
         elif step < _GRASP_END:
-            pos_w, gripper_cmd = self._phase_grasp(cube_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_grasp(cube_pos_w, num_envs, device)
         elif step < _LIFT_CUBE_END:
-            pos_w, gripper_cmd = self._phase_lift_cube(cube_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_lift_cube(cube_pos_w, num_envs, device)
         elif step < _MOVE_TO_MIDDLE_END:
-            pos_w, gripper_cmd = self._phase_move_to_middle(cube_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_move_to_middle(cube_pos_w, num_envs, device)
         elif step < _HOLD_MIDDLE_END:
-            pos_w, gripper_cmd = self._phase_hold_middle(gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_hold_middle(num_envs, device)
         elif step < _MOVE_ABOVE_TARGET_END:
-            pos_w, gripper_cmd = self._phase_move_above_target(selected_target_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_move_above_target(selected_target_pos_w, num_envs, device)
         elif step < _LOWER_TO_TARGET_END:
-            pos_w, gripper_cmd = self._phase_lower_to_target(selected_target_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_lower_to_target(selected_target_pos_w, num_envs, device)
         elif step < _RELEASE_END:
-            pos_w, gripper_cmd = self._phase_release(selected_target_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_release(selected_target_pos_w, num_envs, device)
         elif step < _LIFT_GRIPPER_END:
-            pos_w, gripper_cmd = self._phase_lift_gripper(selected_target_pos_w, gripper_to_jaw, num_envs, device)
+            jaw_target_w, gripper_cmd = self._phase_lift_gripper(selected_target_pos_w, num_envs, device)
         else:
+            jaw_target_w = None
             pos_w, gripper_cmd = self._phase_return_home(num_envs, device)
+
+        if jaw_target_w is not None:
+            pos_w = jaw_target_w + self._update_jaw_correction(jaw_target_w, jaw_pos_w) - gripper_to_jaw
+        else:
+            # Return-home is commanded directly in the gripper frame, and ``pre_step`` drives the
+            # joints to the rest pose anyway, so the correction neither applies nor carries over.
+            self._last_jaw_target = None
 
         diff_w = pos_w - robot_base_pos_w
         target_pos_local = quat_apply(quat_inv(robot_base_quat_w), diff_w)
         return torch.cat([target_pos_local, target_quat, gripper_cmd], dim=-1)
+
+    def _update_jaw_correction(self, jaw_target_w: torch.Tensor, jaw_pos_w: torch.Tensor) -> torch.Tensor:
+        """Integrate the jaw tracking error while the commanded target is stationary.
+
+        See ``_JAW_CORRECTION_GAIN`` for why this outer loop is needed at all. Integrating only
+        against a stationary target keeps ordinary transit lag -- which is not an error to be
+        cancelled -- out of the accumulator.
+        """
+        if self._jaw_correction is None:
+            self._jaw_correction = torch.zeros_like(jaw_target_w)
+        if self._last_jaw_target is not None:
+            target_moved = torch.linalg.vector_norm(jaw_target_w - self._last_jaw_target, dim=-1, keepdim=True)
+            error = self._last_jaw_target - jaw_pos_w
+            self._jaw_correction = torch.where(
+                target_moved < _JAW_TARGET_STATIC_EPS,
+                (self._jaw_correction + _JAW_CORRECTION_GAIN * error).clamp(
+                    -_JAW_CORRECTION_LIMIT, _JAW_CORRECTION_LIMIT
+                ),
+                self._jaw_correction,
+            )
+        self._last_jaw_target = jaw_target_w.clone()
+        return self._jaw_correction
 
     def advance(self) -> None:
         """Advance the step counter; the episode ends once the return-home phase completes."""
@@ -487,8 +568,11 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._step_count = 0
         self._episode_done = False
         self._initial_ee_pos = None
+        self._initial_jaw_pos = None
         self._initial_ee_quat_world = None
         self._home_start_pos = None
+        self._jaw_correction = None
+        self._last_jaw_target = None
         self._target_is_circle = None
 
     # ------------------------------------------------------------------
@@ -554,69 +638,68 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     # ------------------------------------------------------------------
     # Phase methods
     #
-    # Each phase (other than the final return-home) computes a *jaw* target position; the
-    # `gripper_to_jaw` (world-frame) offset passed in is subtracted to get the actual IK
-    # ("gripper" frame) target sent to the arm.
+    # Each phase (other than the final return-home) returns a *jaw* target position in world
+    # space. ``get_action()`` applies the outer-loop correction and subtracts the gripper-to-jaw
+    # offset to get the actual IK ("gripper" frame) target sent to the arm.
     # ------------------------------------------------------------------
 
-    def _phase_approach_hover(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_approach_hover(self, cube_pos_w, num_envs, device):
         hover_jaw = cube_pos_w.clone()
         hover_jaw[:, 2] += _HOVER_CLEARANCE
-        hover_gripper_target = hover_jaw - gripper_to_jaw
         alpha = self._step_count / _APPROACH_STEPS
-        if self._initial_ee_pos is not None:
-            pos_w = (1.0 - alpha) * self._initial_ee_pos + alpha * hover_gripper_target
+        if self._initial_jaw_pos is not None:
+            jaw_target = (1.0 - alpha) * self._initial_jaw_pos + alpha * hover_jaw
         else:
-            pos_w = hover_gripper_target
-        return pos_w, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+            jaw_target = hover_jaw
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
-    def _phase_lower_to_cube(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_lower_to_cube(self, cube_pos_w, num_envs, device):
         jaw_target = cube_pos_w.clone()
         jaw_target[:, 2] -= _GRASP_DEPTH_BELOW_CENTER
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
-    def _phase_grasp(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_grasp(self, cube_pos_w, num_envs, device):
         jaw_target = cube_pos_w.clone()
         jaw_target[:, 2] -= _GRASP_DEPTH_BELOW_CENTER
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_lift_cube(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_lift_cube(self, cube_pos_w, num_envs, device):
         jaw_target = cube_pos_w.clone()
         jaw_target[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_move_to_middle(self, cube_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_move_to_middle(self, cube_pos_w, num_envs, device):
         lift_jaw = cube_pos_w.clone()
         lift_jaw[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
         alpha = (self._step_count - _LIFT_CUBE_END) / float(_MOVE_TO_MIDDLE_END - _LIFT_CUBE_END)
         jaw_target = (1.0 - alpha) * lift_jaw + alpha * self._hold_pos_world
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_hold_middle(self, gripper_to_jaw, num_envs, device):
+    def _phase_hold_middle(self, num_envs, device):
         jaw_target = self._hold_pos_world.clone()
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_move_above_target(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_move_above_target(self, selected_target_pos_w, num_envs, device):
         target_hover = selected_target_pos_w.clone()
         target_hover[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
         alpha = (self._step_count - _HOLD_MIDDLE_END) / float(_MOVE_ABOVE_TARGET_END - _HOLD_MIDDLE_END)
         jaw_target = (1.0 - alpha) * self._hold_pos_world + alpha * target_hover
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_lower_to_target(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_lower_to_target(self, selected_target_pos_w, num_envs, device):
         jaw_target = selected_target_pos_w.clone()
         jaw_target[:, 2] += _RELEASE_CLEARANCE
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_CLOSE, device=device)
 
-    def _phase_release(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_release(self, selected_target_pos_w, num_envs, device):
         jaw_target = selected_target_pos_w.clone()
         jaw_target[:, 2] += _RELEASE_CLEARANCE
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
-    def _phase_lift_gripper(self, selected_target_pos_w, gripper_to_jaw, num_envs, device):
+    def _phase_lift_gripper(self, selected_target_pos_w, num_envs, device):
         jaw_target = selected_target_pos_w.clone()
         jaw_target[:, 2] += _HOLD_HEIGHT_ABOVE_TABLE
-        return jaw_target - gripper_to_jaw, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
+        return jaw_target, torch.full((num_envs, 1), _GRIPPER_OPEN, device=device)
 
     def _phase_return_home(self, num_envs, device):
         if self._rest_ee_pos_world is not None:
