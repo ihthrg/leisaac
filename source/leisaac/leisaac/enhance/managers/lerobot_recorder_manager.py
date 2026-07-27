@@ -11,7 +11,13 @@ from .recorder_manager import EnhanceDatasetExportMode
 
 
 class LeRobotRecorderManager(RecorderManager):
-    def __init__(self, cfg: object, dataset_cfg: LeRobotDatasetCfg, env: ManagerBasedEnv) -> None:
+    def __init__(
+        self,
+        cfg: object,
+        dataset_cfg: LeRobotDatasetCfg,
+        env: ManagerBasedEnv,
+        step_hz: int | None = None,
+    ) -> None:
         real_export_mode = cfg.dataset_export_mode
         cfg.dataset_export_mode = DatasetExportMode.EXPORT_NONE
         super().__init__(cfg, env)
@@ -35,6 +41,14 @@ class LeRobotRecorderManager(RecorderManager):
         self._dataset_file_handler.create(None, resume=resume)
 
         self._skip_frames = 5
+        self._record_every_n_steps = 1
+        if step_hz is not None:
+            if step_hz < dataset_cfg.fps or step_hz % dataset_cfg.fps != 0:
+                raise ValueError(
+                    "LeRobot recording requires step_hz to be an integer multiple of dataset fps; "
+                    f"got step_hz={step_hz}, dataset_fps={dataset_cfg.fps}."
+                )
+            self._record_every_n_steps = step_hz // dataset_cfg.fps
         self._env_steps_record = torch.zeros(self._env.num_envs)
 
     def __str__(self) -> str:
@@ -57,7 +71,12 @@ class LeRobotRecorderManager(RecorderManager):
 
         env_idx = 0
         self._env_steps_record[env_idx] += 1
-        if self._env_steps_record[env_idx] <= self._skip_frames:
+        step = int(self._env_steps_record[env_idx].item())
+        skipped_steps = self._skip_frames * self._record_every_n_steps
+        if step <= skipped_steps:
+            return
+        if (step - skipped_steps - 1) % self._record_every_n_steps != 0:
+            self._episodes[env_idx]._data.clear()
             return
         frame = self._env.cfg.build_lerobot_frame(self._episodes[env_idx], self._dataset_cfg)
         self._dataset_file_handler.add_frame(frame)

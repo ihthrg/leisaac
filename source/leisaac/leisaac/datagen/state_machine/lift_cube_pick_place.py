@@ -2,7 +2,7 @@
 
 import torch
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_apply, quat_from_euler_xyz, quat_inv, quat_mul
+from isaaclab.utils.math import quat_apply, quat_inv, quat_mul
 from leisaac.tasks.lift_cube.mdp import cube_placed_on_correct_target
 
 from .base import StateMachineBase
@@ -24,6 +24,16 @@ _REST_POSE_DEG = {
     "gripper": -10.0,
 }
 
+_MIDDLE_POSE_DEG = {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": 0.0,
+    "elbow_flex": 0.0,
+    "wrist_flex": 0.0,
+    "wrist_roll": 90.0,
+    "gripper": 0.0,
+}
+"""Middle joint pose: all joints at 0 deg except a 90 deg counter-clockwise wrist roll."""
+
 _REST_POSE_TOLERANCE_DEG = 30.0
 """Per-joint +/- tolerance (deg) used by ``_is_at_rest`` to decide if the arm reached
 ``_REST_POSE_DEG``. Matches the tolerance used by the shared
@@ -44,12 +54,10 @@ _HOVER_CLEARANCE = 0.10
 _RELEASE_CLEARANCE = 0.02
 """Jaw height (m) above the target marker when lowering to release the cube."""
 
-# Phase boundaries (state-machine step count). `LeRobotRecorderManager` records exactly one
-# frame per `env.step()` call, and each `env.step()` advances physics by one sim tick. The
-# simulation runs at 60Hz (`--step_hz 60`), so these must be calibrated as `round(seconds * 60)`
-# to get the intended real motion duration -- independent of the *separately* declared
-# `--lerobot_dataset_fps 30`, which only labels/exports the recording and has no bearing on how
-# much physical time a given number of `env.step()` calls represents.
+# Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim
+# tick, so a 60Hz simulation (`--step_hz 60`) requires `round(seconds * 60)` steps for the
+# intended physical duration. `LeRobotRecorderManager` separately downsamples those steps to the
+# requested dataset rate (`--lerobot_dataset_fps 30`, i.e. every second step here).
 _APPROACH_STEPS = 120  # phase ends at 120 (2.0s): interpolate from initial EE pos to cube hover
 _LOWER_TO_CUBE_END = 180  # +60 (1.0s)
 _GRASP_END = 240  # +60 (1.0s)
@@ -61,6 +69,30 @@ _LOWER_TO_TARGET_END = 720  # +60 (1.0s)
 _RELEASE_END = 760  # +40 (0.67s)
 _LIFT_GRIPPER_END = 800  # +40 (0.67s)
 _TOTAL_STEPS = 1100  # +300 (5.0s): return home, ends the episode
+
+# DEBUG: (step, phase-name) pairs used by the diagnostic print in get_action() to report which
+# phase is starting and the key positions involved -- remove once the grasp/pose issues are
+# resolved and confirmed fixed in sim.
+_PHASE_START_NAMES = (
+    (0, "approach_hover"),
+    (_APPROACH_STEPS, "lower_to_cube"),
+    (_LOWER_TO_CUBE_END, "grasp"),
+    (_GRASP_END, "lift_cube"),
+    (_LIFT_CUBE_END, "move_to_middle"),
+    (_MOVE_TO_MIDDLE_END, "hold_middle"),
+    (_HOLD_MIDDLE_END, "move_above_target"),
+    (_MOVE_ABOVE_TARGET_END, "lower_to_target"),
+    (_LOWER_TO_TARGET_END, "release"),
+    (_RELEASE_END, "lift_gripper"),
+    (_LIFT_GRIPPER_END, "return_home"),
+)
+
+
+def _quat_nlerp(start: torch.Tensor, end: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Interpolate unit quaternions along the shortest path using normalized lerp."""
+    end_shortest = torch.where(torch.sum(start * end, dim=-1, keepdim=True) < 0.0, -end, end)
+    interpolated = start + (end_shortest - start) * alpha
+    return interpolated / torch.linalg.vector_norm(interpolated, dim=-1, keepdim=True).clamp_min(1.0e-8)
 
 
 def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
@@ -82,9 +114,9 @@ def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor
 class LiftCubePickPlaceStateMachine(StateMachineBase):
     """State machine for the conditional lift-cube pick-and-place (sort) task.
 
-    Picks up the cube, holds it for ~3 seconds at the SO-101 calibration "middle position" (all
-    joints at 0 rad -- see ``so101_joint_state_server.py``'s "MIDDLE of its range of motion"
-    calibration step), then places it on whichever target matches its original spawn side:
+    Picks up the cube, holds it for ~3 seconds at the SO-101 "middle position" (all joints at
+    0 deg except a 90 deg counter-clockwise wrist roll), then places it on whichever target
+    matches its original spawn side:
     the circle target if the cube spawned to the right (+X) of the nominal center, or the
     square target if it spawned to the left. Finally returns the arm to the SO-101 rest pose.
 
@@ -98,10 +130,13 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._step_count: int = 0
         self._episode_done: bool = False
         self._initial_ee_pos: torch.Tensor | None = None
+        self._initial_ee_quat_world: torch.Tensor | None = None
         self._rest_ee_pos_world: torch.Tensor | None = None
+        self._rest_ee_quat_world: torch.Tensor | None = None
         self._rest_joint_pos: torch.Tensor | None = None
         self._home_start_pos: torch.Tensor | None = None
         self._hold_pos_world: torch.Tensor | None = None
+        self._hold_quat_world: torch.Tensor | None = None
         self._center_x: float = 0.0
         self._target_is_circle: torch.Tensor | None = None
 
@@ -110,18 +145,16 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     # ------------------------------------------------------------------
 
     def setup(self, env) -> None:
-        """FK calibration for the rest pose; other one-time, env-derived setup.
+        """FK calibration for the rest and middle poses; other one-time setup.
 
-        Teleports the joints to the SO-101 rest pose and reads the resulting world-space EE
-        position via FK. This EE-space target is then used as an ordinary IK target during the
-        return-home phase, so the arm reaches it through the same smooth, physically-simulated
-        motion as every other phase (a direct joint-space teleport would not carry a grasped
-        cube realistically).
+        Teleports the joints first to the SO-101 rest pose and then to the requested middle
+        pose (all joints at 0 deg except ``wrist_roll`` at +90 deg), reading the corresponding
+        world-space gripper/jaw poses via FK. These are used as ordinary IK targets during the
+        episode, so the arm reaches them through smooth, physically-simulated motion rather
+        than teleporting while carrying the cube.
 
-        The "middle position" hold target is *not* calibrated here -- see ``pre_step()``, which
-        captures it directly from each episode's natural post-``env.reset()`` state (the SO-101
-        follower's default joint pose is already all-zero, i.e. the calibration "middle
-        position"), instead of re-deriving it via a separate teleport.
+        The caller resets the environment after ``setup()``, so neither calibration pose leaks
+        into the first recorded episode.
 
         ``center_x`` (the left/right decision threshold) is derived from the cube's *nominal*
         (pre-randomization) spawn point, i.e. ``env.cfg.scene.cube.init_state.pos`` -- the same
@@ -144,7 +177,28 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         )
         env.sim.step(render=False)
         env.scene.update(dt=env.physics_dt)
-        self._rest_ee_pos_world = robot.data.body_pos_w[:, -1, :].clone()
+        # Use the ee_frame's "gripper" target (index 0, no offset) rather than
+        # `robot.data.body_pos_w[:, -1, :]` -- the latter is whatever body happens to be *last*
+        # in the articulation's body list, which is not guaranteed to be "gripper" if e.g. "jaw"
+        # is a separate body ordered after it. This keeps every EE-space position in this file
+        # anchored to the exact same, explicitly-named prim that the IK action also targets.
+        ee_frame = env.scene["ee_frame"]
+        self._rest_ee_pos_world = ee_frame.data.target_pos_w[:, 0, :].clone()
+        self._rest_ee_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
+
+        middle_joint_pos = torch.zeros_like(self._rest_joint_pos)
+        for idx, name in enumerate(joint_names):
+            if name in _MIDDLE_POSE_DEG:
+                middle_joint_pos[:, idx] = _MIDDLE_POSE_DEG[name] * torch.pi / 180.0
+
+        robot.write_joint_state_to_sim(
+            position=middle_joint_pos,
+            velocity=torch.zeros_like(middle_joint_pos),
+        )
+        env.sim.step(render=False)
+        env.scene.update(dt=env.physics_dt)
+        self._hold_pos_world = ee_frame.data.target_pos_w[:, 1, :].clone()
+        self._hold_quat_world = ee_frame.data.target_quat_w[:, 0, :].clone()
 
         nominal_cube_pos = env.cfg.scene.cube.init_state.pos
         self._center_x = float(nominal_cube_pos[0])
@@ -177,30 +231,19 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         return bool(torch.logical_and(placed, at_rest).all().item())
 
     def pre_step(self, env) -> None:
-        """Capture the "middle position" hold target, then snap to rest before the first step.
+        """Snap to rest before the first step, then blend back to rest at the end.
 
-        ``env.reset()`` (called by the caller immediately before every episode's first
-        ``pre_step()``/``get_action()``) resets the robot to its configured default joint pose,
-        which for the SO-101 follower is all-zero -- exactly the calibration "middle position"
-        (see ``so101_joint_state_server.py``'s "MIDDLE of its range of motion" step). So the
-        jaw's *initial* world position, read here before anything else touches the robot,
-        already **is** the middle-position jaw target; no separate FK teleport is needed to
-        re-derive it.
-
-        Only after that capture do we snap the arm to the rest pose, ensuring every recorded
-        episode starts from a consistent rest state (rather than whatever pose the previous
-        episode's reset happened to leave the arm in), matching the same direct
-        joint-state-write technique used at the end of the episode.
+        The middle target was calibrated once in ``setup()`` from the explicit middle joint
+        pose. The initial snap ensures every recorded episode starts from a consistent rest
+        state, matching the direct joint-state-write technique used at the end.
         """
         robot = env.scene["robot"]
-        if self._step_count == 0:
-            self._hold_pos_world = env.scene["ee_frame"].data.target_pos_w[:, 1, :].clone()
-            if self._rest_joint_pos is not None:
-                robot.write_joint_state_to_sim(
-                    position=self._rest_joint_pos,
-                    velocity=torch.zeros_like(self._rest_joint_pos),
-                )
-                env.scene.update(dt=env.physics_dt)
+        if self._step_count == 0 and self._rest_joint_pos is not None:
+            robot.write_joint_state_to_sim(
+                position=self._rest_joint_pos,
+                velocity=torch.zeros_like(self._rest_joint_pos),
+            )
+            env.scene.update(dt=env.physics_dt)
         if self._step_count >= _LIFT_GRIPPER_END and self._rest_joint_pos is not None:
             if self._step_count == _LIFT_GRIPPER_END:
                 self._home_start_pos = robot.data.joint_pos.clone()
@@ -214,12 +257,17 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         Cube/target positions below describe where the *jaw* (fingertip contact point, see
         ``ee_frame``'s second target frame) should be -- not the raw "gripper" IK control frame,
-        which sits at a fixed but non-trivial offset from the jaw. That offset is read live from
-        the ``ee_frame`` sensor (constant here since the commanded gripper orientation never
-        changes) and subtracted from every jaw target to get the actual IK command. Using a
-        hard-coded gripper-frame offset instead (as tuned for the much larger orange in
-        ``pick_orange.py``) placed the gripper's IK point far from this small 3cm cube and the
-        jaw never closed around it.
+        which sits at a fixed but non-trivial offset from the jaw. The rigid offset is measured
+        live, expressed in the gripper's local frame, then rotated by the *target* gripper
+        orientation before being subtracted from every jaw target. This is necessary because
+        using the current world-space offset is only correct when current and target
+        orientations already match.
+
+        The target orientation follows the robot's actual poses: the approach smoothly moves
+        from the rest-pose orientation to the configured initial/middle-pose orientation, task
+        phases keep that initial orientation, and return-home restores the rest orientation.
+        This avoids the previous instantaneous command to world identity at step 0, which made
+        the arm turn left before it even began approaching the cube.
         """
         robot = env.scene["robot"]
         robot.write_joint_damping_to_sim(damping=10.0)
@@ -235,20 +283,47 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         robot_base_quat_w = robot.data.root_quat_w.clone()
 
         ee_frame = env.scene["ee_frame"]
-        gripper_to_jaw = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
-
-        target_quat_w = quat_from_euler_xyz(
-            torch.tensor(0.0, device=device),
-            torch.tensor(0.0, device=device),
-            torch.tensor(0.0, device=device),
-        ).repeat(num_envs, 1)
-        target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
+        current_gripper_quat_w = ee_frame.data.target_quat_w[:, 0, :].clone()
 
         if step == 0:
-            self._initial_ee_pos = robot.data.body_pos_w[:, -1, :].clone()
+            self._initial_ee_pos = ee_frame.data.target_pos_w[:, 0, :].clone()
+            self._initial_ee_quat_world = current_gripper_quat_w.clone()
             self._target_is_circle = cube_pos_w[:, 0] > self._center_x
 
+        if step < _APPROACH_STEPS and self._initial_ee_quat_world is not None and self._hold_quat_world is not None:
+            target_quat_w = _quat_nlerp(
+                self._initial_ee_quat_world,
+                self._hold_quat_world,
+                self._step_count / float(_APPROACH_STEPS),
+            )
+        elif step < _LIFT_GRIPPER_END and self._hold_quat_world is not None:
+            target_quat_w = self._hold_quat_world.clone()
+        elif self._rest_ee_quat_world is not None:
+            target_quat_w = self._rest_ee_quat_world.clone()
+        else:
+            target_quat_w = current_gripper_quat_w
+
+        target_quat = quat_mul(quat_inv(robot_base_quat_w), target_quat_w)
+
+        gripper_to_jaw_world = ee_frame.data.target_pos_w[:, 1, :] - ee_frame.data.target_pos_w[:, 0, :]
+        gripper_to_jaw_local = quat_apply(quat_inv(current_gripper_quat_w), gripper_to_jaw_world)
+        gripper_to_jaw = quat_apply(target_quat_w, gripper_to_jaw_local)
+
         selected_target_pos_w = torch.where(self._target_is_circle.unsqueeze(-1), circle_target_pos_w, target_pos_w)
+
+        # DEBUG: report which phase is starting and the key positions involved (env 0 only) --
+        # remove once the grasp/pose issues are resolved and confirmed fixed in sim.
+        for boundary_step, phase_name in _PHASE_START_NAMES:
+            if step == boundary_step:
+                print(
+                    f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
+                    f"cube_pos={cube_pos_w[0].tolist()} gripper_to_jaw={gripper_to_jaw[0].tolist()} "
+                    f"current_quat_w={current_gripper_quat_w[0].tolist()} "
+                    f"target_quat_w={target_quat_w[0].tolist()} "
+                    f"hold_pos_world={self._hold_pos_world[0].tolist() if self._hold_pos_world is not None else None} "
+                    f"rest_ee_pos_world={self._rest_ee_pos_world[0].tolist() if self._rest_ee_pos_world is not None else None}"
+                )
+                break
 
         if step < _APPROACH_STEPS:
             pos_w, gripper_cmd = self._phase_approach_hover(cube_pos_w, gripper_to_jaw, num_envs, device)
@@ -288,6 +363,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._step_count = 0
         self._episode_done = False
         self._initial_ee_pos = None
+        self._initial_ee_quat_world = None
         self._home_start_pos = None
         self._target_is_circle = None
 

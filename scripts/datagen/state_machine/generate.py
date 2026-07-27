@@ -62,7 +62,7 @@ from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
 # Maps gym task id → (StateMachineClass, device_type)
 TASK_REGISTRY = {
     "LeIsaac-SO101-PickOrange-v0": (PickOrangeStateMachine, "so101_state_machine"),
-    "LeIsaac-SO101-LiftCubePickPlace-v0": (LiftCubePickPlaceStateMachine, "so101_state_machine"),
+    "LeIsaac-SO101-LiftCubePickPlace-v0": (LiftCubePickPlaceStateMachine, "so101_cube_state_machine"),
 }
 
 
@@ -162,7 +162,12 @@ def _replace_recorder_manager(env, env_cfg, args_cli):
             repo_id=args_cli.lerobot_dataset_repo_id,
             fps=args_cli.lerobot_dataset_fps,
         )
-        env.recorder_manager = LeRobotRecorderManager(env_cfg.recorders, dataset_cfg, env)
+        env.recorder_manager = LeRobotRecorderManager(
+            env_cfg.recorders,
+            dataset_cfg,
+            env,
+            step_hz=args_cli.step_hz,
+        )
     else:
         env.recorder_manager = StreamingRecorderManager(env_cfg.recorders, env)
         env.recorder_manager.flush_steps = 100
