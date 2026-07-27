@@ -76,9 +76,33 @@ def init_action_cfg(action_cfg, device):
             joint_names=["gripper"],
             scale=1.0,
         )
+    elif device in ["so101_cube_state_machine"]:
+        # Joint-space: action = 5 arm joint angles (rad) + gripper joint angle (rad).
+        #
+        # Deliberately not the IK action used by ``so101_state_machine`` below. The SO-101 has
+        # five arm joints, so a differential-IK action that consumes a 6-DoF pose is
+        # over-constrained: the Jacobian is 6x5 and always has a left-null direction, and the
+        # solver settles wherever the residual pose error lies entirely in that direction instead
+        # of at the commanded pose. Measured in sim, that left the jaw 14cm from its target at the
+        # end of a 3s approach and let the arm drift 23cm away from a *static* hold command. The
+        # matching state machine therefore plans in joint space against a measured kinematic model
+        # (see ``datagen/state_machine/planar_arm_model.py``).
+        #
+        # This also makes the recorded actions joint angles, matching both this task's
+        # ``observation.state`` and the convention of SO-101 LeRobot datasets recorded from a
+        # physical leader arm (see the ``so101leader`` branch above).
+        action_cfg.arm_action = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"],
+            scale=1.0,
+        )
+        action_cfg.gripper_action = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=["gripper"],
+            scale=1.0,
+        )
     elif device in [
         "so101_state_machine",
-        "so101_cube_state_machine",
     ]:  # IK-based: action = EE pose (7D) + binary gripper, not raw joint angles
         action_cfg.arm_action = mdp.DifferentialInverseKinematicsActionCfg(
             asset_name="robot",
@@ -92,7 +116,7 @@ def init_action_cfg(action_cfg, device):
             asset_name="robot",
             joint_names=["gripper"],
             open_command_expr={"gripper": 1.0},
-            close_command_expr={"gripper": 0.01 if device == "so101_cube_state_machine" else 0.4},
+            close_command_expr={"gripper": 0.4},
         )
     elif device in ["bi_so101_state_machine"]:  # IK-based: action = EE pose (7D) + binary gripper, not raw joint angles
         action_cfg.left_arm_action = mdp.DifferentialInverseKinematicsActionCfg(

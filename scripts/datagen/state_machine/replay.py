@@ -51,13 +51,12 @@ import os
 import time
 
 import gymnasium as gym
+import leisaac  # noqa: F401
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.utils.datasets import EpisodeData, HDF5DatasetFileHandler
 from isaaclab_tasks.utils import parse_env_cfg
 from leisaac.utils.env_utils import get_task_type
-
-import leisaac  # noqa: F401
 
 
 class RateLimiter:
@@ -97,6 +96,11 @@ def apply_damping(env, task_type: str):
     """Apply joint damping each step to match state-machine recording behavior."""
     if task_type == "so101_state_machine":
         env.scene["robot"].write_joint_damping_to_sim(damping=10.0)
+    elif task_type == "so101_cube_state_machine":
+        # Must match LiftCubePickPlaceStateMachine's `_JOINT_DAMPING`: that task commands joint
+        # angles directly, so a different damping would replay the same actions at a different
+        # tracking speed.
+        env.scene["robot"].write_joint_damping_to_sim(damping=3.0)
     elif task_type == "bi_so101_state_machine":
         env.scene["left_arm"].write_joint_damping_to_sim(damping=10.0)
         env.scene["right_arm"].write_joint_damping_to_sim(damping=10.0)
