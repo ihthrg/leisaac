@@ -90,21 +90,20 @@ class RateLimiter:
                 self.last_time += self.sleep_duration
 
 
-def auto_terminate(env: ManagerBasedRLEnv | DirectRLEnv, success: bool):
+def auto_terminate(env: ManagerBasedRLEnv | DirectRLEnv, success: torch.Tensor):
+    """Mark each environment as succeeded or failed independently.
+
+    ``success`` carries one verdict per environment, so a batch of parallel environments keeps the
+    demonstrations that worked instead of discarding all of them because one missed.
+    """
     if hasattr(env, "termination_manager"):
-        if success:
-            env.termination_manager.set_term_cfg(
-                "success",
-                TerminationTermCfg(func=lambda env: torch.ones(env.num_envs, dtype=torch.bool, device=env.device)),
-            )
-        else:
-            env.termination_manager.set_term_cfg(
-                "success",
-                TerminationTermCfg(func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)),
-            )
+        env.termination_manager.set_term_cfg(
+            "success",
+            TerminationTermCfg(func=lambda env, verdict=success.clone(): verdict),
+        )
         env.termination_manager.compute()
     elif hasattr(env, "_get_dones"):
-        env.cfg.return_success_status = success
+        env.cfg.return_success_status = bool(success.all().item())
 
 
 def _configure_env_cfg(env_cfg, args_cli, is_direct_env, output_dir, output_file_name):
@@ -180,20 +179,24 @@ def _on_episode_done(env, sm, args_cli, resume_recorded_demo_count, current_reco
         success = sm.check_success(env)
     except Exception as e:
         print("Success check failed:", e)
-        success = False
+        success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
-    print("Episode success!" if success else "Episode failed!")
+    succeeded = int(success.sum().item())
+    if env.num_envs == 1:
+        print("Episode success!" if succeeded else "Episode failed!")
+    else:
+        print(f"{succeeded}/{env.num_envs} environments succeeded.")
 
     if start_record_state:
         if args_cli.record:
             print("Stop Recording!!!")
         start_record_state = False
 
-    if args_cli.record and success:
-        auto_terminate(env, True)
-        current_recorded_demo_count += 1
+    if args_cli.record:
+        auto_terminate(env, success)
+        current_recorded_demo_count += succeeded
     else:
-        auto_terminate(env, False)
+        auto_terminate(env, torch.zeros_like(success))
 
     if (
         args_cli.record
@@ -215,7 +218,7 @@ def _on_episode_done(env, sm, args_cli, resume_recorded_demo_count, current_reco
 
     env.reset()
     sm.reset()
-    auto_terminate(env, False)
+    auto_terminate(env, torch.zeros_like(success))
 
     if args_cli.record and args_cli.num_demos > 0 and current_recorded_demo_count >= args_cli.num_demos:
         print(f"All {args_cli.num_demos} demonstrations recorded. Exiting the app.")

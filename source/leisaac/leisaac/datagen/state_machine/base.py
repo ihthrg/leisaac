@@ -38,12 +38,17 @@ class StateMachineBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def check_success(self, env) -> bool:
-        """Evaluate whether the current episode was successful.
+    def check_success(self, env) -> torch.Tensor:
+        """Evaluate whether the current episode was successful, per environment.
 
         Called at episode end (when :attr:`is_episode_done` is ``True``)
         before resetting. The implementation may temporarily teleport joints
         to a canonical pose for evaluation.
+
+        Returns:
+            Boolean tensor of shape ``(num_envs,)``. Environments are judged
+            independently so that one failure does not discard the episodes
+            recorded alongside it.
         """
         raise NotImplementedError
 

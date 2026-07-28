@@ -237,6 +237,15 @@ def _ease(alpha: float) -> float:
     return 0.5 - 0.5 * math.cos(math.pi * alpha)
 
 
+def _ease_tensor(alpha: torch.Tensor) -> torch.Tensor:
+    """``_ease`` for a per-environment progress tensor.
+
+    The gripper settles onto whatever each environment's jaws found, at whatever step they found
+    it, so its easing cannot share the single scalar progress the arm phases use.
+    """
+    return 0.5 - 0.5 * torch.cos(math.pi * torch.clamp(alpha, 0.0, 1.0))
+
+
 def _is_at_rest(joint_pos: torch.Tensor, joint_names: list[str]) -> torch.Tensor:
     """Check whether every joint is within ``_REST_POSE_TOLERANCE_DEG`` of ``_REST_POSE_DEG``."""
     is_rest = torch.ones(joint_pos.shape[0], dtype=torch.bool, device=joint_pos.device)
@@ -295,10 +304,12 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._rest_arm: torch.Tensor | None = None
         self._hold_arm: torch.Tensor | None = None
         self._gripper_index: int = -1
-        self._grip_hold: float | None = None
-        self._grip_contact: tuple[int, float] = (0, _GRIPPER_CLOSE_RAD)
-        self._grip_last_pos: float | None = None
-        self._grip_stalled_steps: int = 0
+        self._grip_hold: torch.Tensor | None = None
+        self._grip_latched: torch.Tensor | None = None
+        self._grip_contact_step: torch.Tensor | None = None
+        self._grip_contact_command: torch.Tensor | None = None
+        self._grip_last_pos: torch.Tensor | None = None
+        self._grip_stalled_steps: torch.Tensor | None = None
         self._finger_drop: float = 0.0
         self._table_bite: float = 0.0
         self._start_arm: torch.Tensor | None = None
@@ -562,8 +573,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             bite = max(bite, height_of(achieved) - height_of(wanted))
         return bite
 
-    def check_success(self, env) -> bool:
-        """Return True if the cube is on its correct target and the arm is at rest."""
+    def check_success(self, env) -> torch.Tensor:
+        """Return, for each environment, whether the cube is on its correct target and the arm is at rest."""
         placed = cube_placed_on_correct_target(
             env,
             cube_cfg=SceneEntityCfg("cube"),
@@ -583,7 +594,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             env.scene.update(dt=env.physics_dt)
         at_rest = _is_at_rest(robot.data.joint_pos, robot.data.joint_names)
 
-        return bool(torch.logical_and(placed, at_rest).all().item())
+        return torch.logical_and(placed, at_rest)
 
     def pre_step(self, env) -> None:
         """Snap to the rest pose before the first step of an episode.
@@ -623,6 +634,12 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             self._cube_pos_w = env.scene["cube"].data.root_pos_w.clone()
             self._target_is_circle = self._cube_pos_w[:, 0] > self._center_x
             self._start_arm = robot.data.joint_pos[:, self._arm_indices].clone()
+            self._grip_hold = torch.full((env.num_envs,), _GRIPPER_CLOSE_RAD, device=env.device)
+            self._grip_latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            self._grip_contact_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+            self._grip_contact_command = torch.full((env.num_envs,), _GRIPPER_CLOSE_RAD, device=env.device)
+            self._grip_stalled_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+            self._grip_last_pos = None
 
         place_pos_w = torch.where(
             self._target_is_circle.unsqueeze(-1),
@@ -705,8 +722,11 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             # not to read the gripper because of it -- see ``_SUCCESS_GRIPPER_THRESHOLD``.
             gripper = self._ease_scalar(_GRIPPER_OPEN_RAD, _GRIPPER_REST_RAD, progress)
 
-        gripper_cmd = torch.full((env.num_envs, 1), gripper, device=env.device)
-        return torch.cat([arm, gripper_cmd], dim=-1)
+        # Phases that do not touch the cube command one angle for every environment; the ones that
+        # do return a value per environment.
+        if not isinstance(gripper, torch.Tensor):
+            gripper = torch.full((env.num_envs,), float(gripper), device=env.device)
+        return torch.cat([arm, gripper.unsqueeze(-1)], dim=-1)
 
     def advance(self) -> None:
         """Advance the step counter; the episode ends once the return-home phase completes."""
@@ -723,23 +743,25 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._cube_pos_w = None
         self._target_is_circle = None
         self._grip_hold = None
-        self._grip_contact = (0, _GRIPPER_CLOSE_RAD)
+        self._grip_latched = None
+        self._grip_contact_step = None
+        self._grip_contact_command = None
         self._grip_last_pos = None
-        self._grip_stalled_steps = 0
+        self._grip_stalled_steps = None
 
     # ------------------------------------------------------------------
 
     @property
-    def _grip_command(self) -> float:
-        """Gripper command to hold while the cube is being carried.
+    def _grip_command(self) -> torch.Tensor:
+        """Gripper command to hold while the cube is being carried, one value per environment.
 
-        Falls back to the fully-shut command when nothing was ever felt, which leaves the jaws
-        closed on empty air -- the honest outcome for an episode that missed the cube, and one the
-        success check will reject on its own.
+        Environments that never felt anything keep the fully-shut command they were initialised
+        with, which leaves their jaws closed on empty air -- the honest outcome for an episode
+        that missed the cube, and one the success check will reject on its own.
         """
-        return _GRIPPER_CLOSE_RAD if self._grip_hold is None else self._grip_hold
+        return self._grip_hold
 
-    def _closing_gripper(self, robot, step: int) -> float:
+    def _closing_gripper(self, robot, step: int) -> torch.Tensor:
         """Ramp the jaws shut, stop at whatever they land on, and hold a firm squeeze on it.
 
         The ramp is linear rather than eased so the joint's free-running speed -- which is what
@@ -750,35 +772,50 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         squeeze over ``_GRIP_SETTLE_STEPS`` rather than jumped there, which would snatch at the
         cube just as it is being taken hold of.
 
-        The command is one scalar for every environment, so contact is taken from whichever jaws
-        stall first. With only the cube's pose randomised they all block within a hair of each
-        other, so that is also the angle the rest want.
+        Every environment is judged on its own. Only the cube's pose is randomised, but that is
+        enough to move the stall point by a few degrees between environments, and a shared command
+        would hand all of them whichever jaws happened to block first.
         """
-        if self._grip_hold is None:
-            elapsed = step - _LOWER_TO_CUBE_END
-            rate = (_GRIPPER_OPEN_RAD - _GRIPPER_CLOSE_RAD) / _GRASP_CLOSE_STEPS
-            command = _GRIPPER_OPEN_RAD - rate * min(elapsed, _GRASP_CLOSE_STEPS)
-            # Measured before this step's command is applied, so it reflects the previous one.
-            achieved = float(robot.data.joint_pos[:, self._gripper_index].max())
-            closed_by = achieved if self._grip_last_pos is None else self._grip_last_pos - achieved
-            self._grip_last_pos = achieved
+        elapsed = step - _LOWER_TO_CUBE_END
+        rate = (_GRIPPER_OPEN_RAD - _GRIPPER_CLOSE_RAD) / _GRASP_CLOSE_STEPS
+        command = _GRIPPER_OPEN_RAD - rate * min(elapsed, _GRASP_CLOSE_STEPS)
 
-            if elapsed < _GRIP_STALL_BLANKING_STEPS or closed_by > _GRIP_STALL_FRACTION * rate:
-                self._grip_stalled_steps = 0
-                return command
-            self._grip_stalled_steps += 1
-            if self._grip_stalled_steps < _GRIP_STALL_STEPS:
-                return command
+        # Measured before this step's command is applied, so it reflects the previous one.
+        achieved = robot.data.joint_pos[:, self._gripper_index]
+        closed_by = achieved if self._grip_last_pos is None else self._grip_last_pos - achieved
+        self._grip_last_pos = achieved.clone()
 
-            self._grip_hold = max(achieved - _GRIP_SQUEEZE_RAD, _GRIPPER_CLOSE_RAD)
-            self._grip_contact = (step, command)
-            print(
-                f"[LiftCubePickPlace] jaws stalled at gripper={math.degrees(achieved):.1f} deg with the command "
-                f"at {math.degrees(command):.1f} deg; squeezing to {math.degrees(self._grip_hold):.1f} deg"
+        if elapsed < _GRIP_STALL_BLANKING_STEPS:
+            self._grip_stalled_steps = torch.zeros_like(self._grip_stalled_steps)
+        else:
+            self._grip_stalled_steps = torch.where(
+                closed_by > _GRIP_STALL_FRACTION * rate,
+                torch.zeros_like(self._grip_stalled_steps),
+                self._grip_stalled_steps + 1,
             )
 
-        contact_step, contact_command = self._grip_contact
-        return self._ease_scalar(contact_command, self._grip_hold, (step - contact_step) / _GRIP_SETTLE_STEPS)
+        stalled = torch.logical_and(~self._grip_latched, self._grip_stalled_steps >= _GRIP_STALL_STEPS)
+        if bool(stalled.any()):
+            hold = torch.clamp(achieved - _GRIP_SQUEEZE_RAD, min=_GRIPPER_CLOSE_RAD)
+            self._grip_hold = torch.where(stalled, hold, self._grip_hold)
+            self._grip_contact_step = torch.where(
+                stalled, torch.full_like(self._grip_contact_step, step), self._grip_contact_step
+            )
+            self._grip_contact_command = torch.where(
+                stalled, torch.full_like(self._grip_contact_command, command), self._grip_contact_command
+            )
+            self._grip_latched = torch.logical_or(self._grip_latched, stalled)
+            for env_id in stalled.nonzero(as_tuple=False).flatten().tolist():
+                print(
+                    f"[LiftCubePickPlace][env={env_id}] jaws stalled at "
+                    f"gripper={math.degrees(float(achieved[env_id])):.1f} deg with the command at "
+                    f"{math.degrees(command):.1f} deg; squeezing to "
+                    f"{math.degrees(float(self._grip_hold[env_id])):.1f} deg"
+                )
+
+        settling = _ease_tensor((step - self._grip_contact_step) / _GRIP_SETTLE_STEPS)
+        eased = self._grip_contact_command + (self._grip_hold - self._grip_contact_command) * settling
+        return torch.where(self._grip_latched, eased, torch.full_like(eased, command))
 
     # Joint-space helpers
     # ------------------------------------------------------------------

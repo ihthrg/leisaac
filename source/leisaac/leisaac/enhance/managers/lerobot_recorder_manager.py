@@ -11,6 +11,18 @@ from .recorder_manager import EnhanceDatasetExportMode
 
 
 class LeRobotRecorderManager(RecorderManager):
+    """Recorder that writes episodes in the LeRobot dataset format.
+
+    A ``LeRobotDataset`` has exactly one episode buffer: ``add_frame`` appends to it and
+    ``save_episode`` commits it. With several environments running at once their frames would
+    interleave into a single nonsense episode, so frames are collected per environment here and
+    replayed into the dataset one environment at a time when the episode ends.
+
+    That buffering holds one episode's frames -- images included -- in memory for every
+    environment. At 640x480 with two cameras and 30 fps that is roughly 1.8 MB per frame, so a
+    23 s episode costs about 1.3 GB per environment. Choose ``--num_envs`` with that in mind.
+    """
+
     def __init__(
         self,
         cfg: object,
@@ -50,6 +62,7 @@ class LeRobotRecorderManager(RecorderManager):
                 )
             self._record_every_n_steps = step_hz // dataset_cfg.fps
         self._env_steps_record = torch.zeros(self._env.num_envs)
+        self._pending_frames: dict[int, list[dict]] = {env_id: [] for env_id in range(self._env.num_envs)}
 
     def __str__(self) -> str:
         msg = "[Enhanced] LeRobotRecorderManager. \n"
@@ -63,24 +76,26 @@ class LeRobotRecorderManager(RecorderManager):
         if env_ids is None:
             env_ids = list(range(self._env.num_envs))
         self._env_steps_record[env_ids] = 0
+        for env_id in env_ids:
+            self._pending_frames[int(env_id)] = []
         return super().reset(env_ids)
 
     def record_post_step(self) -> None:
-        """add frame to lerobot dataset after record_post_step"""
+        """Buffer this step's frame for every environment."""
         super().record_post_step()
 
-        env_idx = 0
-        self._env_steps_record[env_idx] += 1
-        step = int(self._env_steps_record[env_idx].item())
         skipped_steps = self._skip_frames * self._record_every_n_steps
-        if step <= skipped_steps:
-            return
-        if (step - skipped_steps - 1) % self._record_every_n_steps != 0:
+        for env_idx in range(self._env.num_envs):
+            self._env_steps_record[env_idx] += 1
+            step = int(self._env_steps_record[env_idx].item())
+            if step <= skipped_steps:
+                continue
+            if (step - skipped_steps - 1) % self._record_every_n_steps != 0:
+                self._episodes[env_idx]._data.clear()
+                continue
+            frame = self._env.cfg.build_lerobot_frame(self._episodes[env_idx], self._dataset_cfg)
+            self._pending_frames[env_idx].append(frame)
             self._episodes[env_idx]._data.clear()
-            return
-        frame = self._env.cfg.build_lerobot_frame(self._episodes[env_idx], self._dataset_cfg)
-        self._dataset_file_handler.add_frame(frame)
-        self._episodes[env_idx]._data.clear()
 
     def export_episodes(self, env_ids: Sequence[int] | None = None) -> None:
         # Do nothing if no active recorder terms are provided
@@ -92,12 +107,15 @@ class LeRobotRecorderManager(RecorderManager):
         if isinstance(env_ids, torch.Tensor):
             env_ids = env_ids.tolist()
 
-        # Export episode data through dataset exporter
+        # Export episode data through dataset exporter, one environment at a time: the dataset
+        # holds a single episode buffer, so these cannot be interleaved.
         for env_id in env_ids:
             if env_id in self._episodes:
                 episode_succeeded = self._episodes[env_id].success
                 target_dataset_file_handler = self._dataset_file_handler
                 if episode_succeeded:
+                    for frame in self._pending_frames[env_id]:
+                        target_dataset_file_handler.add_frame(frame)
                     target_dataset_file_handler.flush()
                     self._exported_successful_episode_count[env_id] = (
                         self._exported_successful_episode_count.get(env_id, 0) + 1
@@ -107,6 +125,7 @@ class LeRobotRecorderManager(RecorderManager):
                     self._exported_failed_episode_count[env_id] = (
                         self._exported_failed_episode_count.get(env_id, -1) + 1
                     )  # default to -1 to handle the first reset
+                self._pending_frames[env_id] = []
             # Reset the episode buffer for the given environment after export
             self._episodes[env_id] = EpisodeData()
 
