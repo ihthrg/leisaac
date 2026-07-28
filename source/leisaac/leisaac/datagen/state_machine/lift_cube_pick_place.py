@@ -68,18 +68,27 @@ shut on air halted between 2.6 and 3.1 deg, while every real grasp halted betwee
 20.6 deg. This margin sits in that empty band, ten times the 0.5 deg spread of the closed stop and
 still 9 deg below the tightest real grasp."""
 
-_GRIP_SQUEEZE_RAD = 0.20
+_GRIP_SQUEEZE_RAD = 0.15
 """Interference held past the angle the cube stopped the jaws at.
 
-The actuator is position controlled, so this sets the grip force: ``stiffness * this`` = 3.6 N m,
-about 50 N at the finger's ~7 cm radius, well inside the 10 N m effort limit.
+The actuator is position controlled, so this sets the grip force: ``stiffness * this`` = 2.7 N m,
+about 38 N at the finger's ~7 cm radius, well inside the 10 N m effort limit.
 
-That is far more than is needed to carry a light cube, and deliberately so. The cube is grasped
-with up to 30 deg of yaw on it, so the jaws close on a corner rather than a face; a finger bearing
-on a corner torques the cube towards lying flat against it, and the sim logs show exactly that
-happening -- 23.7 deg of misalignment became 8.1 deg during the grasp. What they also show is the
-rotation stopping part-way, leaving the cube cocked and free to slip out. The grip has to be firm
-enough to finish turning the cube against table friction, not merely to hold it once turned."""
+That is still far more than is needed to carry a light cube, and deliberately so. The cube is
+grasped with up to 30 deg of yaw on it, so the jaws close on a corner rather than a face; a finger
+bearing on a corner torques the cube towards lying flat against it, and the sim logs show exactly
+that happening -- 23.7 deg of misalignment became 8.1 deg during the grasp. What they also show is
+the rotation stopping part-way, leaving the cube cocked and free to slip out. The grip has to be
+firm enough to finish turning the cube against table friction, not merely to hold it once turned.
+
+Lowered from 0.20 rad (3.6 N m) on request. Grasps stall between 14.0 and 20.6 deg, and the clamp
+at ``_GRIPPER_CLOSE_RAD`` never reaches that far, so the whole reduction lands on the grip: the
+held command now sits 8.6 deg inside the stall instead of 11.5 deg, i.e. at 5.4 to 12.0 deg rather
+than 2.5 to 9.1 deg.
+
+The failure this risks is specific, and worth watching for rather than assuming away: a cube still
+visibly cocked as it leaves the table, or one that slips out during the lift or the carry. Either
+means the squeeze no longer finishes squaring it, and the number should go back up."""
 
 _GRIP_SETTLE_STEPS = 30
 """Steps (0.5s) spent easing the command back from where contact was noticed to the squeeze."""
