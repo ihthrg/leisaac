@@ -199,6 +199,16 @@ Driving the arm there rather than teleporting it is the other half. Teleporting 
 inside whatever is in the way and reports it as reached; driving it and reading where it *stops*
 is what makes the obstacle measurable at all."""
 
+_TABLE_BITE_WARN = 0.004
+"""Table-probe reading (m) above which ``setup()`` warns rather than quietly lifting the grasp.
+
+The grasp only has a few millimetres of room. The gripper's lowest point sits about 15 mm below
+the point the model tracks, and the cube is 30 mm tall, so raising the grasp much beyond a
+millimetre or two starts the moving finger above the cube's top face -- it then sweeps across the
+top rather than down the side, and shoves the cube away instead of pinning it. A reading this
+large means the probe is hitting something the grasp pose itself would not, and the number should
+be investigated rather than trusted."""
+
 # Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim tick,
 # so a 60Hz simulation (`--step_hz 60`) needs `round(seconds * 60)` steps for the intended
 # duration. `LeRobotRecorderManager` separately downsamples those steps to the requested dataset
@@ -471,6 +481,13 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
                 f"{residual * 1000.0:.1f} mm at the hold pose. Every jaw target will be off by roughly that "
                 "much; check that the calibration probes are being held steady."
             )
+        if self._table_bite > _TABLE_BITE_WARN:
+            print(
+                "[LiftCubePickPlace][setup] WARNING: the table probe wants the grasp raised "
+                f"{self._table_bite * 1000.0:.1f} mm, far more than the millimetre or two it should take. The "
+                "grasp is being lifted far enough that the moving finger may start above the cube and sweep "
+                "it aside instead of pinning it; check what the probe is actually landing on."
+            )
 
     def _measure_finger_drop(self, env, robot, probe) -> float:
         """How far (m) the lowest fingertip hangs below the point the model tracks.
@@ -497,7 +514,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         return tracked_z - min(closed_tip[2], open_tip[2])
 
     def _measure_table_bite(self, env, robot, write_pose, drive_pose) -> float:
-        """How far (m) the gripper reaches below the fingertip ``ee_frame`` reports.
+        """How much (m) the grasp height has to rise for the gripper to stop touching the table.
 
         ``_measure_finger_drop`` can only see the frame Isaac Sim publishes, which follows the
         *moving* finger. Whatever the stationary finger, its knuckle or its mount extend below that
@@ -506,9 +523,18 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         grasp command, which is the signature of something touching down there.
 
         Nothing in the reported frames will ever reveal that geometry, so it is measured by running
-        into it. The arm is commanded to put the reported fingertip exactly at table height and
-        allowed to settle; whatever stops it above that command is the unreported reach, and the
-        interference driven while measuring is only that same small amount.
+        into it: the arm is driven to the grasp pose and however far it settles above its command is
+        how far that pose has to rise.
+
+        Probing **at the grasp height** is the whole point, and probing anywhere else is wrong.
+        ``top_down_joints`` gives up gripper pitch where a vertical gripper is out of reach, so the
+        arm's posture -- and therefore which part of the gripper hangs lowest -- depends on the
+        height being asked for. Reading it 13 mm lower, with the reported fingertip at table height,
+        returned 10.1 mm where the grasp pose itself only wanted 1.2 mm. Lifting the grasp by that
+        put the moving finger above the cube: it swept across the top instead of down the side,
+        shoved the cube 14.5 mm, flipped it 19.4 mm into the air and closed on nothing. The window
+        is narrow -- a 30 mm cube, and a gripper whose lowest point sits 15 mm below the tracked
+        one -- so the correction has to be exactly the height's own, not another pose's.
 
         The probe is swung sideways about ``shoulder_pan`` so it lands on bare table rather than on
         the cube. Panning rotates the arm about a vertical axis, leaving every link pitch -- and so
@@ -520,10 +546,10 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         cube_pos_w = env.scene["cube"].data.root_pos_w
         hover_w = cube_pos_w.clone()
         hover_w[:, 2] += _HOVER_CLEARANCE
-        # Reported fingertip exactly at table height: the probe then reads the unreported reach
-        # directly, and presses into the table by no more than that amount.
+        # Probed at the height the grasp will actually use, so the reading is the correction that
+        # height needs and nothing else.
         touch_w = cube_pos_w.clone()
-        touch_w[:, 2] += self._finger_drop - 0.5 * _CUBE_SIZE
+        touch_w[:, 2] += self._finger_drop + _FINGER_TABLE_CLEARANCE - 0.5 * _CUBE_SIZE
 
         pan_index = self._arm_names.index("shoulder_pan")
         offset = math.radians(_TABLE_PROBE_PAN_OFFSET_DEG)
