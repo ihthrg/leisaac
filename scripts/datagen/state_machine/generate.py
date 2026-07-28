@@ -245,6 +245,15 @@ def main():
     env_cfg.use_teleop_device(device)
     env_cfg.seed = args_cli.seed if args_cli.seed is not None else int(time.time())
 
+    if args_cli.quality:
+        # Matches teleop_se3_agent.py. This script accepted --quality and then ignored it, so a
+        # run asking for better rendering got the default and said nothing about it -- which is
+        # the worst way for a flag to fail, because the output looks like an answer. It matters
+        # here: at --num_envs 2 the recorded images lose about half their vertical detail
+        # (measured by image_sharpness_check.py), and this is the first thing to try against that.
+        env_cfg.sim.render.antialiasing_mode = "FXAA"
+        env_cfg.sim.render.rendering_mode = "quality"
+
     is_direct_env = "Direct" in task_name
     _configure_env_cfg(env_cfg, args_cli, is_direct_env, output_dir, output_file_name)
 
