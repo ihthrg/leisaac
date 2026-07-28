@@ -20,7 +20,7 @@ python scripts/datagen/state_machine/generate.py \
 
 - `--task`: Task environment name to run, e.g., `LeIsaac-SO101-PickOrange-v0`. See [here](/resources/available_env) for available tasks.
 
-- `--num_envs`: Number of parallel simulation environments. Every environment runs the same scripted timeline against its own randomised scene, and is judged and recorded on its own, so this multiplies the demonstrations collected per wall-clock second. LeRobot recording buffers one episode per environment in memory (roughly 1.3 GB each at 640x480 with two cameras), so raise it gradually.
+- `--num_envs`: Number of parallel simulation environments. Every environment runs the same scripted timeline against its own randomised scene, and is judged and recorded on its own, so this multiplies the demonstrations collected per wall-clock second. Use a count that tiles square — `1`, `4`, `9`, `16` — because the others cost recorded image detail; see [Checking recorded image quality](#checking-recorded-image-quality). LeRobot recording buffers one episode per environment in memory (roughly 1.3 GB each at 640x480 with two cameras), so raise it gradually.
 
 - `--device`: Computation device, such as `cpu` or `cuda` (GPU).
 
@@ -54,16 +54,26 @@ Grasp success rate depends heavily on orange spawn positions. Adjusting the spaw
 
 ## Checking recorded image quality
 
-Raising `--num_envs` gives every environment a smaller share of the renderer, and past a point the camera images come out visibly smeared while the dataset itself still looks perfectly well-formed — the right frame count, contiguous timestamps, and video that plays. Nothing downstream will complain, so it is worth measuring before recording a large batch.
+Isaac Lab renders every environment's camera into one shared buffer, laid out as `ceil(sqrt(n))` columns by however many rows that needs. The buffer therefore has the cameras' aspect ratio multiplied by `columns / rows`, and when those are not equal the recorded images lose detail along one axis. The dataset still looks perfectly well-formed — the right frame count, contiguous timestamps, video that plays — so nothing downstream complains.
 
-Record the same task twice, changing only `--num_envs`, then compare them:
+Only counts that tile square are safe. Measured on this task with `image_sharpness_check.py`, where the number is the vertical detail remaining relative to the horizontal:
+
+| `--num_envs` | grid | buffer | detail ratio |
+| --- | --- | --- | --- |
+| 1 | 1x1 | 640x480 | 0.70 |
+| 2 | 2x1 | 1280x480 | 0.41 |
+| 4 | 2x2 | 1280x960 | 0.70 |
+
+So `--num_envs 2` is the configuration to avoid, and `--num_envs 4` collects four times as fast at full quality. `--quality` does not recover the loss; it is not an anti-aliasing problem. `1, 4, 9, 16, 25` and so on all tile square, and `generate.py` warns when the count you asked for does not.
+
+To check a recording yourself, record the same task twice changing only `--num_envs`, then compare them:
 
 ```shell
 python scripts/datagen/state_machine/image_sharpness_check.py \
     ./datasets/check_1env.hdf5 ./datasets/check_2env.hdf5
 ```
 
-The script needs neither Isaac Sim nor this package, and reads LeRobot mp4s as well as HDF5 recordings. It reports the detail left along each image axis and says which of the two plausible culprits fits: an even loss on both axes is video compression, while a loss concentrated on one axis means the frames were already smeared when they reached the recorder, which points at the rendering settings (`--num_envs`, `--quality`).
+The script needs neither Isaac Sim nor this package, and reads LeRobot mp4s as well as HDF5 recordings. It reports the detail left along each image axis and says which of the two plausible culprits fits: an even loss on both axes is video compression, while a loss concentrated on one axis means the frames were already smeared when they reached the recorder.
 
 ## Replay
 
