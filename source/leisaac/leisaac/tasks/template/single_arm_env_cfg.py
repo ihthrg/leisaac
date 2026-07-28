@@ -84,7 +84,9 @@ class SingleArmTaskSceneCfg(InteractiveSceneCfg):
     )
 
     light = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Light",
+        # Outside the per-environment namespace on purpose -- see the note in
+        # ``lift_cube_env_cfg.py``: dome lights are infinite, so one per environment would stack.
+        prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
     )
 
