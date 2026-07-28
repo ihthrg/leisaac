@@ -310,7 +310,11 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     previous = None
     previous_gripper = None
     grasp_target = torch.tensor(cube_pos, dtype=torch.float64) + torch.tensor(
-        [0.0, 0.0, machine._finger_drop + lcpp._FINGER_TABLE_CLEARANCE - 0.5 * lcpp._CUBE_SIZE],
+        [
+            0.0,
+            0.0,
+            machine._finger_drop + machine._table_bite + lcpp._FINGER_TABLE_CLEARANCE - 0.5 * lcpp._CUBE_SIZE,
+        ],
         dtype=torch.float64,
     )
     release_target = env.scene["target" if cube_pos[0] <= nominal[0] else "circle_target"].data.root_pos_w[
@@ -393,6 +397,9 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     # The jaws must notice the cube and then bear on it, and must have finished settling onto it
     # before the phase that lifts it begins.
     assert machine._grip_hold is not None, "the state machine never noticed the cube"
+    # Nothing obstructs the synthetic arm, so the table probe must report nothing. A reading here
+    # would mean it is measuring its own tracking lag rather than an obstacle.
+    assert abs(machine._table_bite) < 1.0e-6, machine._table_bite
     expected_hold = max(blocking - lcpp._GRIP_SQUEEZE_RAD, lcpp._GRIPPER_CLOSE_RAD)
     assert abs(machine._grip_hold - expected_hold) < 1.0e-9, machine._grip_hold
     assert abs(grasp_end_command - machine._grip_hold) < 1.0e-6, grasp_end_command
