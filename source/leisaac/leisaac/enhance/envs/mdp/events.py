@@ -8,6 +8,37 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import Camera
 
+NOMINAL_CAMERA_POSE_ATTR = "_leisaac_nominal_camera_pose"
+"""Attribute cached on a camera asset holding its world pose before any randomization."""
+
+
+def _nominal_camera_pose(
+    asset: Camera, convention: Literal["opengl", "ros", "world"]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the camera world pose captured before any randomization was applied.
+
+    The randomization event runs on *every* episode reset. Offsetting from the camera's current
+    pose would compound the perturbations into a random walk that keeps drifting throughout a
+    recording session, so the pose observed before the first perturbation is kept as the anchor.
+    The first reset covers every environment, so the whole buffer can be captured in one go.
+
+    Note that the anchor is expressed in world coordinates. Cameras parented under a robot link
+    therefore stop following that link across resets if the robot's own base pose is randomized.
+    """
+    cache = getattr(asset, NOMINAL_CAMERA_POSE_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(asset, NOMINAL_CAMERA_POSE_ATTR, cache)
+    if convention not in cache:
+        if convention == "ros":
+            quat_w = asset.data.quat_w_ros
+        elif convention == "opengl":
+            quat_w = asset.data.quat_w_opengl
+        else:
+            quat_w = asset.data.quat_w_world
+        cache[convention] = (asset.data.pos_w.clone(), quat_w.clone())
+    return cache[convention]
+
 
 def randomize_camera_uniform(
     env: ManagerBasedRLEnv,
@@ -19,7 +50,9 @@ def randomize_camera_uniform(
     """Reset the camera to a random position and rotation uniformly within the given ranges.
 
     * It samples the camera position and rotation from the given ranges and adds them to the
-      default camera position and rotation, before setting them into the physics simulation.
+      camera's nominal (pre-randomization) position and rotation, before setting them into the
+      physics simulation. Offsetting from the nominal pose rather than the current one keeps
+      repeated resets from accumulating into a drift.
 
     The function takes a dictionary of pose ranges for each axis and rotation. The keys of the
     dictionary are ``x``, ``y``, ``z``, ``roll``, ``pitch``, and ``yaw``. The values are tuples of the form
@@ -27,13 +60,9 @@ def randomize_camera_uniform(
     """
     asset: Camera = env.scene[asset_cfg.name]
 
-    ori_pos_w = asset.data.pos_w[env_ids]
-    if convention == "ros":
-        ori_quat_w = asset.data.quat_w_ros[env_ids]
-    elif convention == "opengl":
-        ori_quat_w = asset.data.quat_w_opengl[env_ids]
-    elif convention == "world":
-        ori_quat_w = asset.data.quat_w_world[env_ids]
+    nominal_pos_w, nominal_quat_w = _nominal_camera_pose(asset, convention)
+    ori_pos_w = nominal_pos_w[env_ids]
+    ori_quat_w = nominal_quat_w[env_ids]
 
     range_list = [pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
     ranges = torch.tensor(range_list, device=asset.device)
