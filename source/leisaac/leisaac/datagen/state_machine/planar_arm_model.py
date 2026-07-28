@@ -126,7 +126,6 @@ class PlanarArmModel:
         grasp_fraction: float = 0.5,
         gripper_closed: float = 0.0,
         gripper_open: float = 0.0,
-        finger_direction: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
         self.pan_axis = pan_axis
         self.pan_sign = pan_sign
@@ -148,9 +147,6 @@ class PlanarArmModel:
         self.gripper_closed = gripper_closed
         self.gripper_open = gripper_open
         """Gripper joint angles (rad) the two calibration probes used."""
-        self.finger_direction = finger_direction
-        """Closed-to-open fingertip vector at the reference pose, as ``(forward, height, lateral)``
-        in the arm plane's own frame. Its heading says which way the jaws face."""
 
     # ------------------------------------------------------------------
     # Gripper
@@ -161,23 +157,6 @@ class PlanarArmModel:
     # face sitting exactly where the moving one rests when shut -- and it does not. Callers close
     # onto the object and stop when it pushes back instead; see the grasp phase of
     # ``LiftCubePickPlaceStateMachine``.
-
-    def finger_azimuth(self, pan: float) -> float:
-        """Heading the jaws open along, in the base frame, with the gripper pointing straight down.
-
-        The fingertip vector is rigidly attached to the wrist link, so pitching the gripper down
-        rotates its in-plane part while leaving its sideways part alone; ``shoulder_pan`` then
-        swings the whole thing about the vertical. Both are exact, which is why this needs no
-        probing beyond the two the model already takes.
-        """
-        forward, height, lateral = self.finger_direction
-        turn = -0.5 * math.pi - self.pitch_offsets[2]
-        in_plane = forward * math.cos(turn) - height * math.sin(turn)
-        return wrap_to_pi(
-            math.atan2(self.plane_dir[1], self.plane_dir[0])
-            + self.pan_sign * (pan - self.pan_zero)
-            + math.atan2(lateral, in_plane)
-        )
 
     # ------------------------------------------------------------------
     # Forward direction
@@ -458,7 +437,6 @@ def calibrate_planar_arm(
     )
     lateral_closed, lateral_open = lateral_of(at_zero), lateral_of(at_zero_open)
     plane_offset = lateral_closed + fraction * (lateral_open - lateral_closed)
-    finger_direction = (open_p[0] - zero_p[0], open_p[1] - zero_p[1], lateral_open - lateral_closed)
 
     lengths = (
         math.dist(elbow, shoulder),
@@ -491,5 +469,4 @@ def calibrate_planar_arm(
         grasp_fraction=fraction,
         gripper_closed=math.radians(gripper_closed_deg),
         gripper_open=math.radians(gripper_open_deg),
-        finger_direction=finger_direction,
     )
