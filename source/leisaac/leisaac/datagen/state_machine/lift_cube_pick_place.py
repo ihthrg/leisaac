@@ -26,10 +26,17 @@ _GRIPPER_CLOSE_RAD = 0.01
 
 ``_GRIPPER_CLOSE_RAD`` is what the jaws are ramped towards when gripping, but they are not expected
 to reach it: the cube stops them first, and the grip holds just inside wherever that turns out to
-be -- see ``_GRIP_CONTACT_LAG_RAD`` below."""
+be -- see ``_GRIP_STALL_FRACTION`` and ``_GRIP_SQUEEZE_RAD`` below."""
 
 _CUBE_SIZE = 0.03
-"""Edge length (m) of the cube this task picks up."""
+"""Edge length (m) of the cube this task picks up.
+
+Measured from the asset, not assumed: the collider mesh in
+``assets/scenes/table_with_cube/cube/`` is an eight-vertex box 30.15 mm on a side, and
+``model.xml`` gives its region bbox as ``size="0.015077 ..."`` (MuJoCo box sizes are half
+extents). Nothing scales it on the way into the scene, which the sim confirms -- the fingertip
+came to rest 15.2 mm from the cube's centre along the cube's own X axis. The 0.15 mm rounded off
+here is well inside the calibration's own residual."""
 
 _CUBE_HALF_SPAN = 0.5 * _CUBE_SIZE * math.sqrt(2.0)
 """Half the cube's widest horizontal silhouette, i.e. across its diagonal.
