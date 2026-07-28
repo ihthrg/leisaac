@@ -185,6 +185,20 @@ free air.
 fingers are far longer than the cube is tall, so they still straddle it from well below its
 mid-height."""
 
+_TABLE_PROBE_PAN_OFFSET_DEG = 25.0
+_TABLE_PROBE_SETTLE_STEPS = 90
+"""Table-contact probe: swing the grasp configuration this far about ``shoulder_pan`` so it meets
+bare table instead of the cube, command it, and give it this long (1.5 s, nine actuator time
+constants) to settle.
+
+Panning is what makes the probe valid. It rotates the whole arm about a vertical axis, so every
+link pitch -- and therefore every height, and therefore which part of the gripper is lowest -- is
+identical to the real grasp; only the heading changes.
+
+Driving the arm there rather than teleporting it is the other half. Teleporting places the arm
+inside whatever is in the way and reports it as reached; driving it and reading where it *stops*
+is what makes the obstacle measurable at all."""
+
 # Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim tick,
 # so a 60Hz simulation (`--step_hz 60`) needs `round(seconds * 60)` steps for the intended
 # duration. `LeRobotRecorderManager` separately downsamples those steps to the requested dataset
@@ -292,6 +306,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._grip_last_pos: float | None = None
         self._grip_stalled_steps: int = 0
         self._finger_drop: float = 0.0
+        self._table_bite: float = 0.0
         self._start_arm: torch.Tensor | None = None
         self._home_start_arm: torch.Tensor | None = None
         self._cube_pos_w: torch.Tensor | None = None
@@ -361,6 +376,23 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         probe_indices = [joint_names.index(name) for name in _PROBE_JOINT_NAMES]
 
+        def drive_pose(pose_deg: dict[str, float], steps: int) -> torch.Tensor:
+            """Command a pose and let the arm *drive* to it, then report the arm joints it reached.
+
+            Unlike ``write_pose`` this does not teleport. Teleporting puts the arm inside whatever
+            is in the way and reports it as reached; driving it there and reading where it stops is
+            the only way to find out that something stopped it.
+            """
+            joint_pos = torch.zeros(env.num_envs, len(joint_names), device=env.device)
+            for idx, name in enumerate(joint_names):
+                joint_pos[:, idx] = math.radians(pose_deg.get(name, 0.0))
+            robot.set_joint_position_target(joint_pos)
+            robot.write_data_to_sim()
+            for _ in range(steps):
+                env.sim.step(render=False)
+            env.scene.update(dt=env.physics_dt)
+            return robot.data.joint_pos[0, self._arm_indices].clone()
+
         def probe(
             pan_deg: float,
             lift_deg: float,
@@ -412,6 +444,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         self._center_x = float(env.cfg.scene.cube.init_state.pos[0])
         self._finger_drop = self._measure_finger_drop(env, robot, probe)
+        self._table_bite = self._measure_table_bite(env, robot, write_pose, drive_pose)
 
         # DEBUG: report the measured model and check that the hold posture actually lands where the
         # model says it should -- remove together with the per-phase print once confirmed in sim.
@@ -429,7 +462,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             f"elbow_flex={math.degrees(hold_elbow):.2f} wrist_flex={math.degrees(hold_wrist_flex):.2f} "
             f"-> link pitches {_HOLD_LINK_PITCHES_DEG} deg, jaw at forward={predicted[0]:.4f} "
             f"height={predicted[1]:.4f} m, model-vs-measured residual={residual * 1000.0:.1f} mm, "
-            f"finger_drop={self._finger_drop * 1000.0:.1f} mm, center_x={self._center_x}"
+            f"finger_drop={self._finger_drop * 1000.0:.1f} mm, table_bite={self._table_bite * 1000.0:.1f} mm, "
+            f"center_x={self._center_x}"
         )
         if residual > _CALIB_RESIDUAL_WARN:
             print(
@@ -461,6 +495,62 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         open_tip = probe(*probe_deg, _WRIST_ROLL_DEG, math.degrees(_GRIPPER_OPEN_RAD))[0]
         tracked_z = closed_tip[2] + self._model.grasp_fraction * (open_tip[2] - closed_tip[2])
         return tracked_z - min(closed_tip[2], open_tip[2])
+
+    def _measure_table_bite(self, env, robot, write_pose, drive_pose) -> float:
+        """How far (m) the gripper reaches below the fingertip ``ee_frame`` reports.
+
+        ``_measure_finger_drop`` can only see the frame Isaac Sim publishes, which follows the
+        *moving* finger. Whatever the stationary finger, its knuckle or its mount extend below that
+        point is invisible to it, and comes straight out of the table clearance: in sim, aiming the
+        reported fingertip 8 mm above the table still left the arm held 1.2 mm short of a static
+        grasp command, which is the signature of something touching down there.
+
+        Nothing in the reported frames will ever reveal that geometry, so it is measured by running
+        into it. The arm is commanded to put the reported fingertip exactly at table height and
+        allowed to settle; whatever stops it above that command is the unreported reach, and the
+        interference driven while measuring is only that same small amount.
+
+        The probe is swung sideways about ``shoulder_pan`` so it lands on bare table rather than on
+        the cube. Panning rotates the arm about a vertical axis, leaving every link pitch -- and so
+        the whole vertical geometry -- exactly as the grasp will have it.
+
+        Both gripper angles are tried and the worse taken, because which part hangs lowest changes
+        as the jaws close and the grasp passes through the whole range.
+        """
+        cube_pos_w = env.scene["cube"].data.root_pos_w
+        hover_w = cube_pos_w.clone()
+        hover_w[:, 2] += _HOVER_CLEARANCE
+        # Reported fingertip exactly at table height: the probe then reads the unreported reach
+        # directly, and presses into the table by no more than that amount.
+        touch_w = cube_pos_w.clone()
+        touch_w[:, 2] += self._finger_drop - 0.5 * _CUBE_SIZE
+
+        pan_index = self._arm_names.index("shoulder_pan")
+        offset = math.radians(_TABLE_PROBE_PAN_OFFSET_DEG)
+        if float(self._solve_arm(robot, touch_w)[0, pan_index]) + offset > float(self._joint_limits[pan_index, 1]):
+            offset = -offset
+
+        def swung(target_w: torch.Tensor, gripper_deg: float) -> dict[str, float]:
+            solution = self._solve_arm(robot, target_w)
+            pose = {name: math.degrees(float(solution[0, idx])) for idx, name in enumerate(self._arm_names)}
+            pose["shoulder_pan"] += math.degrees(offset)
+            pose["gripper"] = gripper_deg
+            return pose
+
+        def height_of(arm_row: torch.Tensor) -> float:
+            angles = {name: float(arm_row[idx]) for idx, name in enumerate(self._arm_names)}
+            return self._model.jaw_in_plane(angles["shoulder_lift"], angles["elbow_flex"], angles["wrist_flex"])[1]
+
+        bite = 0.0
+        for gripper_deg in (math.degrees(_GRIPPER_OPEN_RAD), math.degrees(_GRIPPER_CLOSE_RAD)):
+            # Start clear of the table so the arm comes down onto it instead of being placed inside
+            # it, then command the touching pose and read where it actually stops.
+            write_pose(swung(hover_w, gripper_deg))
+            commanded = swung(touch_w, gripper_deg)
+            achieved = drive_pose(commanded, _TABLE_PROBE_SETTLE_STEPS)
+            wanted = torch.tensor([math.radians(commanded[name]) for name in self._arm_names], device=achieved.device)
+            bite = max(bite, height_of(achieved) - height_of(wanted))
+        return bite
 
     def check_success(self, env) -> bool:
         """Return True if the cube is on its correct target and the arm is at rest."""
@@ -540,8 +630,13 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         hover = raised(self._cube_pos_w, _HOVER_CLEARANCE)
         # Referenced to the table the cube sits on, not to the cube's centre, because what must
-        # not collide is the fingertip and what it must not collide with is the table.
-        grasp = raised(self._cube_pos_w, self._finger_drop + _FINGER_TABLE_CLEARANCE - 0.5 * _CUBE_SIZE)
+        # not collide is the gripper's lowest point and what it must not collide with is the table.
+        # Both offsets are measured in ``setup()``: what the reported fingertip clears, and what it
+        # does not report at all.
+        grasp = raised(
+            self._cube_pos_w,
+            self._finger_drop + self._table_bite + _FINGER_TABLE_CLEARANCE - 0.5 * _CUBE_SIZE,
+        )
         lifted = raised(self._cube_pos_w, _HOLD_HEIGHT_ABOVE_TABLE)
         place_hover = raised(place_pos_w, _HOLD_HEIGHT_ABOVE_TABLE)
         place_release = raised(place_pos_w, _RELEASE_CLEARANCE)
