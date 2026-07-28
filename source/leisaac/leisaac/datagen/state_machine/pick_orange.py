@@ -94,8 +94,8 @@ class PickOrangeStateMachine(StateMachineBase):
         env.scene.update(dt=env.physics_dt)
         self._rest_ee_pos_world = robot.data.body_pos_w[:, -1, :].clone()
 
-    def check_success(self, env) -> bool:
-        """Return True if all oranges are on the plate and the arm is at rest."""
+    def check_success(self, env) -> torch.Tensor:
+        """Return, for each environment, whether all oranges are on the plate and the arm is at rest."""
         robot = env.scene["robot"]
         if self._rest_joint_pos is not None:
             robot.write_joint_state_to_sim(
@@ -113,7 +113,7 @@ class PickOrangeStateMachine(StateMachineBase):
             ],
             plate_cfg=SceneEntityCfg("Plate"),
         )
-        return bool(success_tensor.all().item())
+        return success_tensor
 
     def pre_step(self, env) -> None:
         """Blend joint state toward rest pose during the final orange's home phase.

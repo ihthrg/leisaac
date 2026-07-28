@@ -384,7 +384,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
         f"{release_error * 1000:.4f} mm ({'in' if release_reachable else 'OUT OF'} reach) | "
         f"jaw span = {machine._model.grasp_span * 1000:.1f} mm, grasp at {machine._model.grasp_fraction:.2f} "
         f"of it | jaws stopped at {math.degrees(blocking):.1f} deg, holding "
-        f"{math.degrees(machine._grip_hold):.1f} deg = {squeeze * 1000:.1f} mm of squeeze | "
+        f"{math.degrees(float(machine._grip_hold[0])):.1f} deg = {squeeze * 1000:.1f} mm of squeeze | "
         f"gripper first/last = {math.degrees(first_gripper):.1f}/{math.degrees(last_gripper):.1f} deg | "
         f"hold link pitches = {[round(v, 3) for v in hold_pitches]} deg | "
         f"gripper tilt off vertical: hover {hover_tilt:.2f} deg, grasp {grasp_tilt:.2f} deg | "
@@ -396,13 +396,19 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
         assert release_error < 1.0e-9, release_error
     # The jaws must notice the cube and then bear on it, and must have finished settling onto it
     # before the phase that lifts it begins.
-    assert machine._grip_hold is not None, "the state machine never noticed the cube"
+    assert bool(machine._grip_latched.all()), "the state machine never noticed the cube"
     # Nothing obstructs the synthetic arm, so the table probe must report nothing. A reading here
     # would mean it is measuring its own tracking lag rather than an obstacle.
     assert abs(machine._table_bite) < 1.0e-6, machine._table_bite
+    # Nothing between the synthetic jaws either, so they must reach the closed command exactly.
+    # A grasp that stalls here would be indistinguishable from one that closed on air.
+    assert abs(machine._empty_grip - lcpp._GRIPPER_CLOSE_RAD) < 1.0e-6, machine._empty_grip
+    # The stall this run recorded must clear that empty stop, or the episode would be thrown away
+    # as a cube that was never gripped.
+    assert float(machine._grip_stall[0]) > machine._empty_grip + lcpp._EMPTY_GRIP_MARGIN, machine._grip_stall
     expected_hold = max(blocking - lcpp._GRIP_SQUEEZE_RAD, lcpp._GRIPPER_CLOSE_RAD)
-    assert abs(machine._grip_hold - expected_hold) < 1.0e-9, machine._grip_hold
-    assert abs(grasp_end_command - machine._grip_hold) < 1.0e-6, grasp_end_command
+    assert abs(float(machine._grip_hold[0]) - expected_hold) < 1.0e-9, machine._grip_hold
+    assert abs(grasp_end_command - float(machine._grip_hold[0])) < 1.0e-6, grasp_end_command
     assert squeeze > 0.005, squeeze
     assert abs(first_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-6, first_gripper
     assert abs(last_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-3, last_gripper
@@ -411,10 +417,61 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     assert math.degrees(max_gripper_jump) < 3.0, max_gripper_jump
 
 
+def run_parallel_gripper(blocking_deg, label):
+    """Close the jaws in several environments whose cubes stop them at different angles.
+
+    The rest of this harness runs one environment at a time, which cannot tell whether the grasp
+    is judged per environment or shared. This drives the closing logic directly with a batch whose
+    jaws block at deliberately different angles: each set must latch at its own stall point and on
+    its own step. A shared command would give them all the first one to block.
+    """
+    lcpp, _ = MODULES
+    blocking = torch.tensor([math.radians(v) for v in blocking_deg], dtype=torch.float64)
+    num_envs = blocking.numel()
+
+    machine = lcpp.LiftCubePickPlaceStateMachine()
+    machine._gripper_index = 5
+    machine._grip_hold = torch.full((num_envs,), lcpp._GRIPPER_CLOSE_RAD, dtype=torch.float64)
+    machine._grip_latched = torch.zeros(num_envs, dtype=torch.bool)
+    machine._grip_stall = torch.full((num_envs,), lcpp._GRIPPER_CLOSE_RAD, dtype=torch.float64)
+    machine._grip_contact_step = torch.zeros(num_envs, dtype=torch.long)
+    machine._grip_contact_command = torch.full((num_envs,), lcpp._GRIPPER_CLOSE_RAD, dtype=torch.float64)
+    machine._grip_stalled_steps = torch.zeros(num_envs, dtype=torch.long)
+    machine._grip_last_pos = None
+
+    robot = FakeRobot.__new__(FakeRobot)
+    robot.data = Data()
+    robot.data.joint_pos = torch.zeros(num_envs, len(JOINT_NAMES), dtype=torch.float64)
+    robot.data.joint_pos[:, 5] = lcpp._GRIPPER_OPEN_RAD
+
+    command = None
+    for step in range(lcpp._LOWER_TO_CUBE_END, lcpp._GRASP_END):
+        command = machine._closing_gripper(robot, step)
+        assert command.shape == (num_envs,), command.shape
+        # Perfect tracking, except that each environment's cube stops its jaws at its own angle.
+        robot.data.joint_pos[:, 5] = torch.maximum(command, blocking)
+
+    expected = torch.clamp(blocking - lcpp._GRIP_SQUEEZE_RAD, min=lcpp._GRIPPER_CLOSE_RAD)
+    print(
+        f"{label}: jaws stopped at {[round(v, 1) for v in blocking_deg]} deg, holding "
+        f"{[round(math.degrees(float(v)), 1) for v in machine._grip_hold]} deg, latched on steps "
+        f"{[int(v) for v in machine._grip_contact_step]}"
+    )
+    assert bool(machine._grip_latched.all()), machine._grip_latched
+    assert torch.allclose(machine._grip_stall, blocking, atol=1.0e-9), machine._grip_stall
+    assert torch.allclose(machine._grip_hold, expected, atol=1.0e-9), machine._grip_hold
+    # Settling must be finished by the end of the phase, in every environment.
+    assert torch.allclose(command, machine._grip_hold, atol=1.0e-9), command
+    # Distinct stall angles must produce distinct latch steps; equal ones would mean the whole
+    # batch is being judged on one environment.
+    assert machine._grip_contact_step.unique().numel() == num_envs, machine._grip_contact_step
+
+
 if __name__ == "__main__":
     _install_stubs()
     MODULES = _load_state_machine()
     for cube in [(0.308, -0.312, 0.056), (0.40, -0.30, 0.056), (0.28, -0.34, 0.056)]:
         run(cube, (0.1159, 0.190, 0.100), (73.59, -12.0, 8.0), (-1.0, -1.0, -1.0), f"cube={cube}")
     run((0.308, -0.312, 0.056), (0.1159, 0.150, 0.140), (73.59, 20.0, -30.0), (-1.0, 1.0, -1.0), "mirrored signs")
+    run_parallel_gripper((20.4, 17.4, 18.4, 14.0), "four environments")
     print("all offline checks passed")

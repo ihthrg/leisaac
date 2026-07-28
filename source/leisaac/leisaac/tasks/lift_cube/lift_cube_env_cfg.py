@@ -83,7 +83,11 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
         update_period=1 / 30.0,
     )
     light = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Light",
+        # Outside the per-environment namespace on purpose. A dome light illuminates from an
+        # infinite sphere, so it is not confined to the environment it is parented under: one per
+        # environment would stack, and `--num_envs 4` would render every camera at four times the
+        # intensity of the single-environment dataset. At `--num_envs 1` this is identical.
+        prim_path="/World/Light",
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=1000.0),
     )
 

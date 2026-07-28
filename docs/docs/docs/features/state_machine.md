@@ -20,7 +20,7 @@ python scripts/datagen/state_machine/generate.py \
 
 - `--task`: Task environment name to run, e.g., `LeIsaac-SO101-PickOrange-v0`. See [here](/resources/available_env) for available tasks.
 
-- `--num_envs`: Number of parallel simulation environments, usually `1`.
+- `--num_envs`: Number of parallel simulation environments. Every environment runs the same scripted timeline against its own randomised scene, and is judged and recorded on its own, so this multiplies the demonstrations collected per wall-clock second. LeRobot recording buffers one episode per environment in memory (roughly 1.3 GB each at 640x480 with two cameras), so raise it gradually.
 
 - `--device`: Computation device, such as `cpu` or `cuda` (GPU).
 
