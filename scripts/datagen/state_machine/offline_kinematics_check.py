@@ -123,6 +123,10 @@ class Data:
     pass
 
 
+_CLOSED_FOR_GAP = [0.0]
+"""Gripper angle the jaws are considered shut at; filled in from the state machine at run time."""
+
+
 class FakeRobot:
     """Analytic SO-101 stand-in that also reproduces the actuator pulling on a written pose.
 
@@ -187,9 +191,14 @@ class FakeRobot:
         base = torch.tensor([[bx, by, height]], dtype=torch.float64)
         return _quat_apply(self.data.root_quat_w, base) + self.data.root_pos_w
 
-    def grasp_center_world(self, closed, open_):
-        """Midpoint of the two fingertips: where an object has to be to end up between them."""
-        return 0.5 * (self.jaw_world(closed) + self.jaw_world(open_))
+    def grasp_center_world(self, closed, open_, fraction):
+        """Point ``fraction`` of the way from the stationary finger to the moving one."""
+        shut = self.jaw_world(closed)
+        return shut + fraction * (self.jaw_world(open_) - shut)
+
+    def jaw_gap(self, gripper):
+        """Distance between the fingertips at the given gripper angle."""
+        return float(torch.linalg.vector_norm(self.jaw_world(gripper) - self.jaw_world(_CLOSED_FOR_GAP[0])))
 
 
 class FakeFrame:
@@ -203,9 +212,12 @@ class FakeFrame:
 
 
 class FakeBody:
-    def __init__(self, pos):
+    def __init__(self, pos, yaw=0.0):
         self.data = Data()
         self.data.root_pos_w = torch.tensor([pos], dtype=torch.float64)
+        self.data.root_quat_w = torch.tensor(
+            [[math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw)]], dtype=torch.float64
+        )
 
 
 class FakeScene(dict):
@@ -255,6 +267,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     machine = lcpp.LiftCubePickPlaceStateMachine()
     machine.setup(env)
     robot = env.scene["robot"]
+    _CLOSED_FOR_GAP[0] = lcpp._GRIPPER_CLOSE_RAD
     limits = machine._joint_limits
     grasp_error = None
     release_error = None
@@ -262,7 +275,12 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     hover_tilt = 0.0
     grasp_tilt = 0.0
     max_jump = 0.0
+    max_gripper_jump = 0.0
+    grip_gap = 0.0
+    first_gripper = None
+    last_gripper = None
     previous = None
+    previous_gripper = None
     grasp_target = torch.tensor(cube_pos, dtype=torch.float64) - torch.tensor(
         [0.0, 0.0, lcpp._GRASP_DEPTH_BELOW_CENTER], dtype=torch.float64
     )
@@ -271,7 +289,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     ] + torch.tensor([0.0, 0.0, lcpp._RELEASE_CLEARANCE], dtype=torch.float64)
 
     def grasp_center():
-        return robot.grasp_center_world(lcpp._GRIPPER_CLOSE_RAD, lcpp._GRIPPER_OPEN_RAD)
+        return robot.grasp_center_world(lcpp._GRIPPER_CLOSE_RAD, lcpp._GRIPPER_OPEN_RAD, machine._model.grasp_fraction)
 
     while not machine.is_episode_done:
         machine.pre_step(env)
@@ -281,6 +299,12 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
         if previous is not None:
             max_jump = max(max_jump, float((action[0, :5] - previous).abs().max()))
         previous = action[0, :5].clone()
+        if previous_gripper is not None:
+            max_gripper_jump = max(max_gripper_jump, abs(float(action[0, 5]) - previous_gripper))
+        previous_gripper = float(action[0, 5])
+        if first_gripper is None:
+            first_gripper = previous_gripper
+        last_gripper = previous_gripper
 
         # Perfect tracking: the actuator is assumed to reach the commanded angle.
         robot.write_joint_state_to_sim(action.clone())
@@ -299,6 +323,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
         if step == lcpp._GRASP_END - 1:
             grasp_tilt = abs(pitches[2] + 90.0)
             grasp_error = float(torch.linalg.vector_norm(grasp_center()[0] - grasp_target))
+            grip_gap = robot.jaw_gap(float(action[0, 5]))
         if step == lcpp._RELEASE_END - 1:
             release_error = float(torch.linalg.vector_norm(grasp_center()[0] - release_target))
         if step == lcpp._HOLD_MIDDLE_END - 1:
@@ -316,16 +341,23 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     print(
         f"{label}: grasp centre error = {grasp_error * 1000:.4f} mm | release centre error = "
         f"{release_error * 1000:.4f} mm ({'in' if release_reachable else 'OUT OF'} reach) | "
-        f"jaw span = {machine._model.grasp_span * 1000:.1f} mm | "
+        f"jaw span = {machine._model.grasp_span * 1000:.1f} mm, grasp at {machine._model.grasp_fraction:.2f} "
+        f"of it | grip gap = {grip_gap * 1000:.1f} mm (want {lcpp._GRASP_GAP * 1000:.0f}) | "
+        f"gripper first/last = {math.degrees(first_gripper):.1f}/{math.degrees(last_gripper):.1f} deg | "
         f"hold link pitches = {[round(v, 3) for v in hold_pitches]} deg | "
         f"gripper tilt off vertical: hover {hover_tilt:.2f} deg, grasp {grasp_tilt:.2f} deg | "
-        f"max per-step joint change = {math.degrees(max_jump):.2f} deg | damping = {robot.damping_history[0]}"
+        f"max per-step change: arm {math.degrees(max_jump):.2f} deg, gripper "
+        f"{math.degrees(max_gripper_jump):.2f} deg"
     )
     assert grasp_error < 1.0e-9, grasp_error
     if release_reachable:
         assert release_error < 1.0e-9, release_error
+    assert abs(grip_gap - lcpp._GRASP_GAP) < 1.0e-3, grip_gap
+    assert abs(first_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-6, first_gripper
+    assert abs(last_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-3, last_gripper
     assert max(abs(a - b) for a, b in zip(hold_pitches, [90.0, 0.0, 0.0])) < 1.0e-3, hold_pitches
     assert math.degrees(max_jump) < 2.5, max_jump
+    assert math.degrees(max_gripper_jump) < 3.0, max_gripper_jump
 
 
 if __name__ == "__main__":
