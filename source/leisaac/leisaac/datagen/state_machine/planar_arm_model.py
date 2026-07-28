@@ -123,6 +123,10 @@ class PlanarArmModel:
         pitch_signs: tuple[float, float, float],
         pan_zero: float = 0.0,
         grasp_span: float = 0.0,
+        grasp_fraction: float = 0.5,
+        gripper_closed: float = 0.0,
+        gripper_open: float = 0.0,
+        finger_direction: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
         self.pan_axis = pan_axis
         self.pan_sign = pan_sign
@@ -137,8 +141,56 @@ class PlanarArmModel:
         self.grasp_span = grasp_span
         """Distance the tracked fingertip travels between the closed and open gripper angles.
 
-        The open jaws are this far apart, so an object wider than it cannot be grasped, and half
-        of it is the clearance either finger has when the tracked midpoint sits on the object."""
+        The open jaws are this far apart, so an object wider than it cannot be grasped."""
+        self.grasp_fraction = grasp_fraction
+        """Where along the open gap the tracked point sits, as a fraction from the stationary
+        finger. ``0.5`` is the middle of the jaws."""
+        self.gripper_closed = gripper_closed
+        self.gripper_open = gripper_open
+        """Gripper joint angles (rad) the two calibration probes used."""
+        self.finger_direction = finger_direction
+        """Closed-to-open fingertip vector at the reference pose, as ``(forward, height, lateral)``
+        in the arm plane's own frame. Its heading says which way the jaws face."""
+
+    # ------------------------------------------------------------------
+    # Gripper
+    # ------------------------------------------------------------------
+
+    def gripper_angle_for_gap(self, gap: float) -> float:
+        """Gripper joint angle (rad) that leaves the jaws ``gap`` metres apart.
+
+        The moving fingertip swings on an arc about its pivot, so the gap is the chord of that
+        arc: ``gap = 2 * radius * sin(travel / 2)``. The two calibration probes give one chord at
+        one known travel, which fixes ``radius`` and inverts the relation exactly -- no assumption
+        that the gap is proportional to the joint angle.
+
+        Commanding a gap slightly under the object rather than closing fully is what turns the
+        grip into a squeeze instead of a slam, and stops the fingers snapping past a light object
+        and flicking it away.
+        """
+        travel = self.gripper_open - self.gripper_closed
+        if abs(travel) < 1.0e-6 or self.grasp_span < 1.0e-6:
+            return self.gripper_closed
+        radius = self.grasp_span / (2.0 * math.sin(0.5 * abs(travel)))
+        half = min(max(gap / (2.0 * radius), -1.0), 1.0)
+        return self.gripper_closed + math.copysign(2.0 * math.asin(half), travel)
+
+    def finger_azimuth(self, pan: float) -> float:
+        """Heading the jaws open along, in the base frame, with the gripper pointing straight down.
+
+        The fingertip vector is rigidly attached to the wrist link, so pitching the gripper down
+        rotates its in-plane part while leaving its sideways part alone; ``shoulder_pan`` then
+        swings the whole thing about the vertical. Both are exact, which is why this needs no
+        probing beyond the two the model already takes.
+        """
+        forward, height, lateral = self.finger_direction
+        turn = -0.5 * math.pi - self.pitch_offsets[2]
+        in_plane = forward * math.cos(turn) - height * math.sin(turn)
+        return wrap_to_pi(
+            math.atan2(self.plane_dir[1], self.plane_dir[0])
+            + self.pan_sign * (pan - self.pan_zero)
+            + math.atan2(lateral, in_plane)
+        )
 
     # ------------------------------------------------------------------
     # Forward direction
@@ -153,7 +205,8 @@ class PlanarArmModel:
         return (
             "pan_axis=(%.4f, %.4f) pan_sign=%+.0f plane_dir=(%.4f, %.4f) lateral=%.4f "
             "shoulder=(%.4f, %.4f) lengths=(%.4f, %.4f, %.4f) "
-            "pitch_offsets_deg=(%.2f, %.2f, %.2f) pitch_signs=(%+.0f, %+.0f, %+.0f) jaw_span=%.4f"
+            "pitch_offsets_deg=(%.2f, %.2f, %.2f) pitch_signs=(%+.0f, %+.0f, %+.0f) "
+            "jaw_span=%.4f grasp_fraction=%.3f"
             % (
                 *self.pan_axis,
                 self.pan_sign,
@@ -164,6 +217,7 @@ class PlanarArmModel:
                 *(math.degrees(value) for value in self.pitch_offsets),
                 *self.pitch_signs,
                 self.grasp_span,
+                self.grasp_fraction,
             )
         )
 
@@ -318,42 +372,49 @@ class PlanarArmModel:
 def calibrate_planar_arm(
     probe,
     delta_deg: float = 45.0,
+    wrist_roll_deg: float = 0.0,
     gripper_closed_deg: float = 0.0,
     gripper_open_deg: float = 0.0,
+    grasp_offset: float | None = None,
 ) -> PlanarArmModel:
     """Measure a :class:`PlanarArmModel` from forward-kinematics probes.
 
     Args:
-        probe: Callable ``(pan_deg, lift_deg, elbow_deg, wrist_flex_deg, gripper_deg)`` returning
-            ``((x, y, z), (pan, lift, elbow, wrist_flex))`` -- the jaw position in the robot base
-            frame, and the joint angles the arm *actually reached*, in radians. Working from the
-            achieved angles rather than the requested ones keeps the result exact even when the
-            arm cannot hold a probe pose perfectly. The caller is responsible for holding
-            ``wrist_roll`` at the value used during the episode; it moves the jaw too, so
-            calibrating at a different value silently biases every solution.
+        probe: Callable ``(pan_deg, lift_deg, elbow_deg, wrist_flex_deg, wrist_roll_deg,
+            gripper_deg)`` returning ``((x, y, z), (pan, lift, elbow, wrist_flex))`` -- the jaw
+            position in the robot base frame, and the joint angles the arm *actually reached*, in
+            radians. Working from the achieved angles rather than the requested ones keeps the
+            result exact even when the arm cannot hold a probe pose perfectly.
         delta_deg: Probe displacement. Large enough to keep the circle fits well conditioned,
             small enough to stay inside every joint limit.
+        wrist_roll_deg: ``wrist_roll`` held for every probe. It moves the jaw, so it has to match
+            the value used during the episode.
         gripper_closed_deg: Gripper angle used for the joint-geometry probes.
         gripper_open_deg: Gripper angle used during the approach and descent. One extra probe at
-            this angle locates the moving finger, and the model then tracks the midpoint between
-            the two -- see the module docstring.
+            this angle locates the moving finger -- see the module docstring.
+        grasp_offset: How far from the *stationary* finger the tracked point should sit, in
+            metres. ``None`` puts it midway between the fingers. Aiming nearer the stationary
+            finger is worth doing when the object's width is known: the moving finger then has
+            less distance to travel before it makes contact, so it shoves the object less far
+            before pinning it. Clamped to the midpoint, since going past it would put the object
+            against the moving finger instead.
 
     Returns:
         The calibrated model.
     """
     # Each joint rotates everything downstream of it about its own axis, so sweeping one joint
     # sends the jaw around a circle centred on that joint. Three points fix each circle exactly.
-    at_zero, zero_joints = probe(0.0, 0.0, 0.0, 0.0, gripper_closed_deg)
-    pan_minus, _ = probe(-delta_deg, 0.0, 0.0, 0.0, gripper_closed_deg)
-    pan_plus, pan_plus_joints = probe(delta_deg, 0.0, 0.0, 0.0, gripper_closed_deg)
-    lift_minus, _ = probe(0.0, -delta_deg, 0.0, 0.0, gripper_closed_deg)
-    lift_plus, lift_plus_joints = probe(0.0, delta_deg, 0.0, 0.0, gripper_closed_deg)
-    elbow_minus, _ = probe(0.0, 0.0, -delta_deg, 0.0, gripper_closed_deg)
-    elbow_plus, elbow_plus_joints = probe(0.0, 0.0, delta_deg, 0.0, gripper_closed_deg)
-    wrist_minus, _ = probe(0.0, 0.0, 0.0, -delta_deg, gripper_closed_deg)
-    wrist_plus, wrist_plus_joints = probe(0.0, 0.0, 0.0, delta_deg, gripper_closed_deg)
+    at_zero, zero_joints = probe(0.0, 0.0, 0.0, 0.0, wrist_roll_deg, gripper_closed_deg)
+    pan_minus, _ = probe(-delta_deg, 0.0, 0.0, 0.0, wrist_roll_deg, gripper_closed_deg)
+    pan_plus, pan_plus_joints = probe(delta_deg, 0.0, 0.0, 0.0, wrist_roll_deg, gripper_closed_deg)
+    lift_minus, _ = probe(0.0, -delta_deg, 0.0, 0.0, wrist_roll_deg, gripper_closed_deg)
+    lift_plus, lift_plus_joints = probe(0.0, delta_deg, 0.0, 0.0, wrist_roll_deg, gripper_closed_deg)
+    elbow_minus, _ = probe(0.0, 0.0, -delta_deg, 0.0, wrist_roll_deg, gripper_closed_deg)
+    elbow_plus, elbow_plus_joints = probe(0.0, 0.0, delta_deg, 0.0, wrist_roll_deg, gripper_closed_deg)
+    wrist_minus, _ = probe(0.0, 0.0, 0.0, -delta_deg, wrist_roll_deg, gripper_closed_deg)
+    wrist_plus, wrist_plus_joints = probe(0.0, 0.0, 0.0, delta_deg, wrist_roll_deg, gripper_closed_deg)
     # Same configuration, jaws open: locates the moving finger against the stationary one.
-    at_zero_open, _ = probe(0.0, 0.0, 0.0, 0.0, gripper_open_deg)
+    at_zero_open, _ = probe(0.0, 0.0, 0.0, 0.0, wrist_roll_deg, gripper_open_deg)
 
     # 1. Pan axis: horizontal circle traced by the jaw as shoulder_pan sweeps.
     horizontal = {
@@ -398,12 +459,19 @@ def calibrate_planar_arm(
         _rotation_sign(wrist, zero_p, to_plane(wrist_plus), wrist_plus_joints[3] - zero_joints[3], "wrist_flex"),
     )
 
-    # 4. The tracked point: midway between the fingertips, so an object aimed at lands between the
-    #    jaws rather than on top of the stationary one. Everything upstream of the wrist is
-    #    unaffected -- only the last link's length and direction change.
+    # 4. The tracked point: far enough along the gap that the object lands between the jaws rather
+    #    than on top of the stationary one, but no further than it has to be. Everything upstream
+    #    of the wrist is unaffected -- only the last link's length and direction change.
     open_p = to_plane(at_zero_open)
-    grasp_p = (0.5 * (zero_p[0] + open_p[0]), 0.5 * (zero_p[1] + open_p[1]))
-    plane_offset = 0.5 * (lateral_of(at_zero) + lateral_of(at_zero_open))
+    span = math.dist(at_zero, at_zero_open)
+    fraction = 0.5 if grasp_offset is None or span < 1.0e-6 else min(grasp_offset / span, 0.5)
+    grasp_p = (
+        zero_p[0] + fraction * (open_p[0] - zero_p[0]),
+        zero_p[1] + fraction * (open_p[1] - zero_p[1]),
+    )
+    lateral_closed, lateral_open = lateral_of(at_zero), lateral_of(at_zero_open)
+    plane_offset = lateral_closed + fraction * (lateral_open - lateral_closed)
+    finger_direction = (open_p[0] - zero_p[0], open_p[1] - zero_p[1], lateral_open - lateral_closed)
 
     lengths = (
         math.dist(elbow, shoulder),
@@ -432,5 +500,9 @@ def calibrate_planar_arm(
         pitch_offsets=pitch_offsets,
         pitch_signs=pitch_signs,
         pan_zero=zero_joints[0],
-        grasp_span=math.dist(at_zero, at_zero_open),
+        grasp_span=span,
+        grasp_fraction=fraction,
+        gripper_closed=math.radians(gripper_closed_deg),
+        gripper_open=math.radians(gripper_open_deg),
+        finger_direction=finger_direction,
     )

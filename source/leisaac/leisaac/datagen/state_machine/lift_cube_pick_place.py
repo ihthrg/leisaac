@@ -22,9 +22,36 @@ _PROBE_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex
 
 _GRIPPER_OPEN_RAD = 1.0
 _GRIPPER_CLOSE_RAD = 0.01
-"""Gripper joint targets (rad). The closed value must stay below the ``0.26`` rad threshold that
-``mdp.object_grasped``/``cube_placed_on_correct_target`` use to tell a closed gripper from an open
-one, and the open value above it."""
+"""Gripper joint angles (rad) the kinematics are calibrated at: the two ends of its travel.
+
+``_GRIPPER_CLOSE_RAD`` is only used for calibration and for the rest pose. The grip itself stops
+at ``_GRASP_GAP`` -- see below."""
+
+_CUBE_SIZE = 0.03
+"""Edge length (m) of the cube this task picks up."""
+
+_GRASP_GAP = 0.028
+"""Jaw gap (m) commanded while gripping: 2 mm narrower than the cube.
+
+Closing all the way instead turns the grip into a slam. The fingers arrive at full speed, and a
+light cube is flicked out from between them before they ever load up against it. Stopping just
+inside the cube makes the same command a squeeze: the fingers meet the faces, the position
+controller holds a small, steady interference, and nothing is thrown."""
+
+_GRASP_FACE_CLEARANCE = 0.005
+"""Gap (m) left between the stationary finger and the cube face while descending.
+
+The tracked point sits ``_CUBE_SIZE / 2 + this`` from the stationary finger, rather than in the
+middle of the jaws. Both keep the cube off the stationary finger on the way down, but the middle
+is needlessly far: the moving finger then has to travel the whole way in before it touches, and
+shoves the cube ahead of it until it pins. Measured in sim at the midpoint, that shove was 18 mm;
+from here it is 5 mm."""
+
+_GRIPPER_REST_RAD = math.radians(-10.0)
+"""Gripper angle at rest -- closed, matching ``_REST_POSE_DEG``.
+
+Episodes start and end with the jaws shut, so a recorded episode begins and ends in the same
+physical state the arm idles in."""
 
 _WRIST_ROLL_DEG = 90.0
 """``wrist_roll`` is held here for the whole episode.
@@ -76,6 +103,14 @@ some phases. At 3.0 that drops to 0.17 s -- still comfortably overdamped, so the
 overshoot and shake the cube loose, but fast enough that every phase settles well before it
 ends."""
 
+_SUCCESS_GRIPPER_THRESHOLD = -1.0
+"""``grasp_threshold`` handed to the placement check at the end of an episode.
+
+That check normally also insists the gripper is open, as evidence the cube was let go. Episodes
+now finish with the jaws shut at the rest pose, so that test would reject every success. Any value
+below the rest angle disables it, and nothing is really lost: the check still requires the cube to
+be stationary on the marker, which cannot happen if it were still being carried."""
+
 _REST_POSE_TOLERANCE_DEG = 30.0
 """Per-joint +/- tolerance (deg) used by ``_is_at_rest``. Matches the shared
 ``SO101_FOLLOWER_REST_POSE_RANGE`` for every joint except ``wrist_roll`` -- this task rests at
@@ -107,15 +142,16 @@ than grazing its top face."""
 # rate (`--lerobot_dataset_fps 30`, i.e. every second step here).
 _APPROACH_STEPS = 180  # phase ends at 180 (3.0s): rest -> hovering above the cube
 _LOWER_TO_CUBE_END = 300  # +120 (2.0s): descend onto the cube
-_GRASP_END = 390  # +90 (1.5s): hold still while the gripper closes
-_LIFT_CUBE_END = 450  # +60 (1.0s)
-_MOVE_TO_MIDDLE_END = 540  # +90 (1.5s)
-_HOLD_MIDDLE_END = 720  # +180 (3.0s) <- user requirement: hold ~3s at the "middle position"
-_MOVE_ABOVE_TARGET_END = 810  # +90 (1.5s)
-_LOWER_TO_TARGET_END = 870  # +60 (1.0s)
-_RELEASE_END = 930  # +60 (1.0s)
-_LIFT_GRIPPER_END = 990  # +60 (1.0s)
-_TOTAL_STEPS = 1290  # +300 (5.0s): return home, ends the episode
+_GRASP_CLOSE_STEPS = 90  # 1.5s spent easing the jaws shut, so they meet the cube instead of hitting it
+_GRASP_END = 450  # +150 (2.5s): close, then hold still for 1.0s so the grip settles
+_LIFT_CUBE_END = 510  # +60 (1.0s)
+_MOVE_TO_MIDDLE_END = 600  # +90 (1.5s)
+_HOLD_MIDDLE_END = 780  # +180 (3.0s) <- user requirement: hold ~3s at the "middle position"
+_MOVE_ABOVE_TARGET_END = 870  # +90 (1.5s)
+_LOWER_TO_TARGET_END = 930  # +60 (1.0s)
+_RELEASE_END = 990  # +60 (1.0s)
+_LIFT_GRIPPER_END = 1050  # +60 (1.0s)
+_TOTAL_STEPS = 1350  # +300 (5.0s): return home, ends the episode
 
 # DEBUG: (step, phase-name) pairs used by the diagnostic print in get_action() -- remove once the
 # grasp and hold posture are confirmed correct in sim.
@@ -201,6 +237,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._rest_joint_pos: torch.Tensor | None = None
         self._rest_arm: torch.Tensor | None = None
         self._hold_arm: torch.Tensor | None = None
+        self._grasp_gripper: float = _GRIPPER_CLOSE_RAD
         self._start_arm: torch.Tensor | None = None
         self._home_start_arm: torch.Tensor | None = None
         self._cube_pos_w: torch.Tensor | None = None
@@ -270,13 +307,20 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
 
         probe_indices = [joint_names.index(name) for name in _PROBE_JOINT_NAMES]
 
-        def probe(pan_deg: float, lift_deg: float, elbow_deg: float, wrist_flex_deg: float, gripper_deg: float):
+        def probe(
+            pan_deg: float,
+            lift_deg: float,
+            elbow_deg: float,
+            wrist_flex_deg: float,
+            wrist_roll_deg: float,
+            gripper_deg: float,
+        ):
             write_pose({
                 "shoulder_pan": pan_deg,
                 "shoulder_lift": lift_deg,
                 "elbow_flex": elbow_deg,
                 "wrist_flex": wrist_flex_deg,
-                "wrist_roll": _WRIST_ROLL_DEG,
+                "wrist_roll": wrist_roll_deg,
                 "gripper": gripper_deg,
             })
             jaw_pos_w = ee_frame.data.target_pos_w[:, 1, :]
@@ -292,9 +336,12 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._model = calibrate_planar_arm(
             probe,
             delta_deg=_CALIB_DELTA_DEG,
+            wrist_roll_deg=_WRIST_ROLL_DEG,
             gripper_closed_deg=math.degrees(_GRIPPER_CLOSE_RAD),
             gripper_open_deg=math.degrees(_GRIPPER_OPEN_RAD),
+            grasp_offset=0.5 * _CUBE_SIZE + _GRASP_FACE_CLEARANCE,
         )
+        self._grasp_gripper = self._model.gripper_angle_for_gap(_GRASP_GAP)
 
         hold_lift, hold_elbow, hold_wrist_flex = self._model.joints_for_link_pitches(*_HOLD_LINK_PITCHES_DEG)
         self._hold_arm = self._arm_command(
@@ -314,9 +361,10 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         # DEBUG: report the measured model and check that the hold posture actually lands where the
         # model says it should -- remove together with the per-phase print once confirmed in sim.
         hold_deg = (0.0, math.degrees(hold_lift), math.degrees(hold_elbow), math.degrees(hold_wrist_flex))
-        closed_tip = probe(*hold_deg, math.degrees(_GRIPPER_CLOSE_RAD))[0]
-        open_tip = probe(*hold_deg, math.degrees(_GRIPPER_OPEN_RAD))[0]
-        measured = tuple(0.5 * (a + b) for a, b in zip(closed_tip, open_tip))
+        closed_tip = probe(*hold_deg, _WRIST_ROLL_DEG, math.degrees(_GRIPPER_CLOSE_RAD))[0]
+        open_tip = probe(*hold_deg, _WRIST_ROLL_DEG, math.degrees(_GRIPPER_OPEN_RAD))[0]
+        fraction = self._model.grasp_fraction
+        measured = tuple(a + fraction * (b - a) for a, b in zip(closed_tip, open_tip))
         predicted = self._model.jaw_in_plane(hold_lift, hold_elbow, hold_wrist_flex)
         residual = math.dist(self._model.to_plane(measured), predicted)
         self._rest_joint_pos = write_pose(_REST_POSE_DEG)
@@ -326,6 +374,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             f"elbow_flex={math.degrees(hold_elbow):.2f} wrist_flex={math.degrees(hold_wrist_flex):.2f} "
             f"-> link pitches {_HOLD_LINK_PITCHES_DEG} deg, jaw at forward={predicted[0]:.4f} "
             f"height={predicted[1]:.4f} m, model-vs-measured residual={residual * 1000.0:.1f} mm, "
+            f"grip gap={_GRASP_GAP * 1000:.0f} mm at gripper={math.degrees(self._grasp_gripper):.1f} deg, "
             f"center_x={self._center_x}"
         )
         if residual > _CALIB_RESIDUAL_WARN:
@@ -336,12 +385,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             )
 
     def check_success(self, env) -> bool:
-        """Return True if the cube is on its correct target and the arm is at rest.
-
-        The placement check is evaluated *before* forcing the rest pose below, since it also
-        inspects the current gripper joint angle (must be open, i.e. the cube was released) --
-        teleporting to the rest pose first would spuriously report the gripper as closed.
-        """
+        """Return True if the cube is on its correct target and the arm is at rest."""
         placed = cube_placed_on_correct_target(
             env,
             cube_cfg=SceneEntityCfg("cube"),
@@ -349,6 +393,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             circle_target_cfg=SceneEntityCfg("circle_target"),
             robot_cfg=SceneEntityCfg("robot"),
             center_x=self._center_x,
+            grasp_threshold=_SUCCESS_GRIPPER_THRESHOLD,
         )
 
         robot = env.scene["robot"]
@@ -422,38 +467,47 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         place_release = raised(place_pos_w, _RELEASE_CLEARANCE)
 
         if step < _APPROACH_STEPS:
-            arm = self._blend(self._start_arm, solve(hover), step / _APPROACH_STEPS)
-            gripper = _GRIPPER_OPEN_RAD
+            progress = step / _APPROACH_STEPS
+            arm = self._blend(self._start_arm, solve(hover), progress)
+            # Opens on the way over rather than starting open, so the episode begins with the arm
+            # in the state it idles in: jaws shut.
+            gripper = self._ease_scalar(_GRIPPER_REST_RAD, _GRIPPER_OPEN_RAD, progress)
         elif step < _LOWER_TO_CUBE_END:
             arm = self._blend(solve(hover), solve(grasp), self._progress(step, _APPROACH_STEPS, _LOWER_TO_CUBE_END))
             gripper = _GRIPPER_OPEN_RAD
         elif step < _GRASP_END:
             arm = solve(grasp)
-            gripper = _GRIPPER_CLOSE_RAD
+            gripper = self._ease_scalar(
+                _GRIPPER_OPEN_RAD, self._grasp_gripper, (step - _LOWER_TO_CUBE_END) / _GRASP_CLOSE_STEPS
+            )
         elif step < _LIFT_CUBE_END:
             arm = self._blend(solve(grasp), solve(lifted), self._progress(step, _GRASP_END, _LIFT_CUBE_END))
-            gripper = _GRIPPER_CLOSE_RAD
+            gripper = self._grasp_gripper
         elif step < _MOVE_TO_MIDDLE_END:
             arm = self._blend(solve(lifted), self._hold_arm, self._progress(step, _LIFT_CUBE_END, _MOVE_TO_MIDDLE_END))
-            gripper = _GRIPPER_CLOSE_RAD
+            gripper = self._grasp_gripper
         elif step < _HOLD_MIDDLE_END:
             arm = self._hold_arm.clone()
-            gripper = _GRIPPER_CLOSE_RAD
+            gripper = self._grasp_gripper
         elif step < _MOVE_ABOVE_TARGET_END:
             arm = self._blend(
                 self._hold_arm, solve(place_hover), self._progress(step, _HOLD_MIDDLE_END, _MOVE_ABOVE_TARGET_END)
             )
-            gripper = _GRIPPER_CLOSE_RAD
+            gripper = self._grasp_gripper
         elif step < _LOWER_TO_TARGET_END:
             arm = self._blend(
                 solve(place_hover),
                 solve(place_release),
                 self._progress(step, _MOVE_ABOVE_TARGET_END, _LOWER_TO_TARGET_END),
             )
-            gripper = _GRIPPER_CLOSE_RAD
+            gripper = self._grasp_gripper
         elif step < _RELEASE_END:
             arm = solve(place_release)
-            gripper = _GRIPPER_OPEN_RAD
+            # Eased open over the first half of the phase rather than sprung: snapping the jaws
+            # apart around a cube resting on the marker can flick it back off.
+            gripper = self._ease_scalar(
+                self._grasp_gripper, _GRIPPER_OPEN_RAD, 2.0 * self._progress(step, _LOWER_TO_TARGET_END, _RELEASE_END)
+            )
         elif step < _LIFT_GRIPPER_END:
             arm = self._blend(
                 solve(place_release), solve(place_hover), self._progress(step, _RELEASE_END, _LIFT_GRIPPER_END)
@@ -462,12 +516,11 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         else:
             if self._home_start_arm is None:
                 self._home_start_arm = solve(place_hover)
-            arm = self._blend(
-                self._home_start_arm, self._rest_arm, self._progress(step, _LIFT_GRIPPER_END, _TOTAL_STEPS)
-            )
-            # The gripper stays open through return-home: the success check reads the live gripper
-            # angle to confirm the cube was released, and only teleports to the rest pose after.
-            gripper = _GRIPPER_OPEN_RAD
+            progress = self._progress(step, _LIFT_GRIPPER_END, _TOTAL_STEPS)
+            arm = self._blend(self._home_start_arm, self._rest_arm, progress)
+            # Shuts on the way home, so the arm ends in its idle state. The success check is told
+            # not to read the gripper because of it -- see ``_SUCCESS_GRIPPER_THRESHOLD``.
+            gripper = self._ease_scalar(_GRIPPER_OPEN_RAD, _GRIPPER_REST_RAD, progress)
 
         self._log_phase_start(env, robot, step, arm)
 
@@ -527,6 +580,11 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         """Ease from ``start`` to ``end`` in joint space."""
         return start + (end - start) * _ease(alpha)
 
+    @staticmethod
+    def _ease_scalar(start: float, end: float, alpha: float) -> float:
+        """Ease a single joint angle. Used for the gripper, which is commanded as a scalar."""
+        return start + (end - start) * _ease(alpha)
+
     def _log_phase_start(self, env, robot, step: int, arm: torch.Tensor) -> None:
         """DEBUG: report the commanded and achieved state at each phase boundary.
 
@@ -549,8 +607,24 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             f"joints={self._arm_names} "
             f"cmd_deg={[round(math.degrees(float(value)), 1) for value in arm[0]]} "
             f"actual_deg={[round(math.degrees(float(value)), 1) for value in measured]} "
-            f"cmd_link_pitch_deg={[round(math.degrees(wrap_to_pi(value)), 1) for value in pitches]}"
+            f"cmd_link_pitch_deg={[round(math.degrees(wrap_to_pi(value)), 1) for value in pitches]} "
+            f"jaw_heading_deg={math.degrees(self._model.finger_azimuth(commanded['shoulder_pan'])):.1f} "
+            f"cube_heading_deg={math.degrees(self._cube_heading(env, robot)):.1f}"
         )
+
+    @staticmethod
+    def _cube_heading(env, robot) -> float:
+        """Base-frame heading of the cube's own X axis, i.e. which way its faces point.
+
+        Reported only, for now. The cube spawns with up to 30 deg of yaw, so the jaws can meet it
+        corner-on rather than face-on; comparing this with ``jaw_heading_deg`` modulo 90 deg says
+        by how much.
+        """
+        cube_quat_w = env.scene["cube"].data.root_quat_w
+        axis = torch.zeros_like(cube_quat_w[:, :3])
+        axis[:, 0] = 1.0
+        axis_b = quat_apply(quat_inv(robot.data.root_quat_w), quat_apply(cube_quat_w, axis))
+        return float(torch.atan2(axis_b[0, 1], axis_b[0, 0]))
 
     # ------------------------------------------------------------------
     # Properties
