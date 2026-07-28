@@ -52,6 +52,19 @@ python scripts/datagen/state_machine/generate.py \
 Grasp success rate depends heavily on orange spawn positions. Adjusting the spawn positions in the task's environment config file (e.g. moving oranges closer to the robot base) can significantly improve success rate.
 ::::
 
+## Checking recorded image quality
+
+Raising `--num_envs` gives every environment a smaller share of the renderer, and past a point the camera images come out visibly smeared while the dataset itself still looks perfectly well-formed — the right frame count, contiguous timestamps, and video that plays. Nothing downstream will complain, so it is worth measuring before recording a large batch.
+
+Record the same task twice, changing only `--num_envs`, then compare them:
+
+```shell
+python scripts/datagen/state_machine/image_sharpness_check.py \
+    ./datasets/check_1env.hdf5 ./datasets/check_2env.hdf5
+```
+
+The script needs neither Isaac Sim nor this package, and reads LeRobot mp4s as well as HDF5 recordings. It reports the detail left along each image axis and says which of the two plausible culprits fits: an even loss on both axes is video compression, while a loss concentrated on one axis means the frames were already smeared when they reached the recorder, which points at the rendering settings (`--num_envs`, `--quality`).
+
 ## Replay
 
 After recording, you can replay the collected demonstrations in simulation:
