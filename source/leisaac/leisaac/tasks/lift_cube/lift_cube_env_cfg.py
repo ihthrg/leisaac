@@ -19,6 +19,7 @@ from leisaac.enhance.envs.manager_based_rl_digital_twin_env_cfg import (
 )
 from leisaac.utils.domain_randomization import (
     domain_randomization,
+    randomize_camera_uniform,
     randomize_object_uniform,
 )
 from leisaac.utils.env_utils import delete_attribute
@@ -182,8 +183,21 @@ class LiftCubeEnvCfg(SingleArmTaskEnvCfg):
                         "yaw": (-30 * torch.pi / 180, 30 * torch.pi / 180),
                     },
                 ),
-                # removed front camera randomization so `front` camera is not
-                # included in recorded/randomized sensors
+                # `front` is not part of this scene (see LiftCubeSceneCfg.__post_init__), so only
+                # the overhead camera is perturbed. The ranges stand in for the mounting tolerance
+                # of the real rig; the convention matches the camera's offset above.
+                randomize_camera_uniform(
+                    "top",
+                    pose_range={
+                        "x": (-0.01, 0.01),
+                        "y": (-0.01, 0.01),
+                        "z": (-0.01, 0.01),
+                        "roll": (-1.0 * torch.pi / 180, 1.0 * torch.pi / 180),
+                        "pitch": (-1.0 * torch.pi / 180, 1.0 * torch.pi / 180),
+                        "yaw": (-1.0 * torch.pi / 180, 1.0 * torch.pi / 180),
+                    },
+                    convention="ros",
+                ),
             ],
         )
 
