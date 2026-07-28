@@ -309,8 +309,9 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     last_gripper = None
     previous = None
     previous_gripper = None
-    grasp_target = torch.tensor(cube_pos, dtype=torch.float64) - torch.tensor(
-        [0.0, 0.0, lcpp._GRASP_DEPTH_BELOW_CENTER], dtype=torch.float64
+    grasp_target = torch.tensor(cube_pos, dtype=torch.float64) + torch.tensor(
+        [0.0, 0.0, machine._finger_drop + lcpp._FINGER_TABLE_CLEARANCE - 0.5 * lcpp._CUBE_SIZE],
+        dtype=torch.float64,
     )
     release_target = env.scene["target" if cube_pos[0] <= nominal[0] else "circle_target"].data.root_pos_w[
         0
