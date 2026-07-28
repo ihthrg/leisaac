@@ -126,6 +126,16 @@ class Data:
 _CLOSED_FOR_GAP = [0.0]
 """Gripper angle the jaws are considered shut at; filled in from the state machine at run time."""
 
+STATIONARY_FINGER_BACKOFF = 0.005
+"""How far behind the closed fingertip the stationary finger's contact face actually sits.
+
+Isaac Sim reports the moving finger only, so this offset is invisible to the state machine -- and
+it is exactly what broke commanding a jaw width: aiming for a 28 mm grip on the 30 mm cube left a
+33 mm gap, so the cube was nudged across and never pinched. Modelling it here means the harness
+fails any attempt to go back to computing the width instead of closing until something pushes
+back.
+"""
+
 
 class FakeRobot:
     """Analytic SO-101 stand-in that also reproduces the actuator pulling on a written pose.
@@ -200,6 +210,22 @@ class FakeRobot:
         """Distance between the fingertips at the given gripper angle."""
         return float(torch.linalg.vector_norm(self.jaw_world(gripper) - self.jaw_world(_CLOSED_FOR_GAP[0])))
 
+    def blocking_gripper(self, obstacle_width):
+        """Gripper angle at which an object of that width stops the jaws.
+
+        ``jaw_gap`` rises monotonically with the opening, so a bisection inverts it exactly, which
+        keeps the harness independent of the arc geometry ``jaw_world`` happens to use.
+        """
+        travel = obstacle_width - STATIONARY_FINGER_BACKOFF
+        low, high = _CLOSED_FOR_GAP[0], 2.0
+        for _ in range(80):
+            mid = 0.5 * (low + high)
+            if self.jaw_gap(mid) < travel:
+                low = mid
+            else:
+                high = mid
+        return 0.5 * (low + high)
+
 
 class FakeFrame:
     def __init__(self, robot):
@@ -268,6 +294,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     machine.setup(env)
     robot = env.scene["robot"]
     _CLOSED_FOR_GAP[0] = lcpp._GRIPPER_CLOSE_RAD
+    blocking = robot.blocking_gripper(lcpp._CUBE_SIZE)
     limits = machine._joint_limits
     grasp_error = None
     release_error = None
@@ -277,6 +304,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     max_jump = 0.0
     max_gripper_jump = 0.0
     grip_gap = 0.0
+    grasp_end_command = 0.0
     first_gripper = None
     last_gripper = None
     previous = None
@@ -294,6 +322,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     while not machine.is_episode_done:
         machine.pre_step(env)
         action = machine.get_action(env)
+        step = machine.step_count
         assert action.shape == (1, 6), action.shape
         assert torch.all(action[:, :5] >= limits[:, 0] - 1e-9) and torch.all(action[:, :5] <= limits[:, 1] + 1e-9)
         if previous is not None:
@@ -306,11 +335,15 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
             first_gripper = previous_gripper
         last_gripper = previous_gripper
 
-        # Perfect tracking: the actuator is assumed to reach the commanded angle.
-        robot.write_joint_state_to_sim(action.clone())
+        # Perfect tracking, except that the cube physically stops the jaws: below the blocking
+        # angle the joint simply cannot follow the command, which is the only cue the state
+        # machine gets that it has hold of anything.
+        tracked = action.clone()
+        if lcpp._LOWER_TO_CUBE_END <= step < lcpp._RELEASE_END:
+            tracked[0, 5] = max(float(tracked[0, 5]), blocking)
+        robot.write_joint_state_to_sim(tracked)
         env.scene.update()
 
-        step = machine.step_count
         angles = {name: float(action[0, i]) for i, name in enumerate(machine._arm_names)}
         pitches = [
             math.degrees(pam.wrap_to_pi(v))
@@ -323,6 +356,7 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
         if step == lcpp._GRASP_END - 1:
             grasp_tilt = abs(pitches[2] + 90.0)
             grasp_error = float(torch.linalg.vector_norm(grasp_center()[0] - grasp_target))
+            grasp_end_command = float(action[0, 5])
             grip_gap = robot.jaw_gap(float(action[0, 5]))
         if step == lcpp._RELEASE_END - 1:
             release_error = float(torch.linalg.vector_norm(grasp_center()[0] - release_target))
@@ -338,11 +372,14 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
         return span <= sum(machine._model.lengths)
 
     release_reachable = reachable(release_target.unsqueeze(0))
+    blocked_gap = robot.jaw_gap(blocking)
+    squeeze = blocked_gap - grip_gap
     print(
         f"{label}: grasp centre error = {grasp_error * 1000:.4f} mm | release centre error = "
         f"{release_error * 1000:.4f} mm ({'in' if release_reachable else 'OUT OF'} reach) | "
         f"jaw span = {machine._model.grasp_span * 1000:.1f} mm, grasp at {machine._model.grasp_fraction:.2f} "
-        f"of it | grip gap = {grip_gap * 1000:.1f} mm (want {lcpp._GRASP_GAP * 1000:.0f}) | "
+        f"of it | jaws stopped at {math.degrees(blocking):.1f} deg, holding "
+        f"{math.degrees(machine._grip_hold):.1f} deg = {squeeze * 1000:.1f} mm of squeeze | "
         f"gripper first/last = {math.degrees(first_gripper):.1f}/{math.degrees(last_gripper):.1f} deg | "
         f"hold link pitches = {[round(v, 3) for v in hold_pitches]} deg | "
         f"gripper tilt off vertical: hover {hover_tilt:.2f} deg, grasp {grasp_tilt:.2f} deg | "
@@ -352,7 +389,12 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     assert grasp_error < 1.0e-9, grasp_error
     if release_reachable:
         assert release_error < 1.0e-9, release_error
-    assert abs(grip_gap - lcpp._GRASP_GAP) < 1.0e-3, grip_gap
+    # The jaws must notice the cube and then bear on it, and must have finished settling onto it
+    # before the phase that lifts it begins.
+    assert machine._grip_hold is not None, "the state machine never noticed the cube"
+    assert abs(machine._grip_hold - (blocking - lcpp._GRIP_SQUEEZE_RAD)) < 1.0e-9, machine._grip_hold
+    assert abs(grasp_end_command - machine._grip_hold) < 1.0e-6, grasp_end_command
+    assert 0.001 < squeeze < 0.010, squeeze
     assert abs(first_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-6, first_gripper
     assert abs(last_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-3, last_gripper
     assert max(abs(a - b) for a, b in zip(hold_pitches, [90.0, 0.0, 0.0])) < 1.0e-3, hold_pitches

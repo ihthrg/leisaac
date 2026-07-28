@@ -156,24 +156,11 @@ class PlanarArmModel:
     # Gripper
     # ------------------------------------------------------------------
 
-    def gripper_angle_for_gap(self, gap: float) -> float:
-        """Gripper joint angle (rad) that leaves the jaws ``gap`` metres apart.
-
-        The moving fingertip swings on an arc about its pivot, so the gap is the chord of that
-        arc: ``gap = 2 * radius * sin(travel / 2)``. The two calibration probes give one chord at
-        one known travel, which fixes ``radius`` and inverts the relation exactly -- no assumption
-        that the gap is proportional to the joint angle.
-
-        Commanding a gap slightly under the object rather than closing fully is what turns the
-        grip into a squeeze instead of a slam, and stops the fingers snapping past a light object
-        and flicking it away.
-        """
-        travel = self.gripper_open - self.gripper_closed
-        if abs(travel) < 1.0e-6 or self.grasp_span < 1.0e-6:
-            return self.gripper_closed
-        radius = self.grasp_span / (2.0 * math.sin(0.5 * abs(travel)))
-        half = min(max(gap / (2.0 * radius), -1.0), 1.0)
-        return self.gripper_closed + math.copysign(2.0 * math.asin(half), travel)
+    # There is deliberately no "joint angle that leaves the jaws N metres apart" here. Isaac Sim
+    # reports the moving finger only, so any such figure rests on the stationary finger's contact
+    # face sitting exactly where the moving one rests when shut -- and it does not. Callers close
+    # onto the object and stop when it pushes back instead; see the grasp phase of
+    # ``LiftCubePickPlaceStateMachine``.
 
     def finger_azimuth(self, pan: float) -> float:
         """Heading the jaws open along, in the base frame, with the gripper pointing straight down.
