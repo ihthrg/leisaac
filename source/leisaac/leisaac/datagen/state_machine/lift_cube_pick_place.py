@@ -9,7 +9,7 @@ from leisaac.assets.robots.lerobot import SO101_FOLLOWER_USD_JOINT_LIMLITS
 from leisaac.tasks.lift_cube.mdp import cube_placed_on_correct_target
 
 from .base import StateMachineBase
-from .planar_arm_model import calibrate_planar_arm, wrap_to_pi
+from .planar_arm_model import calibrate_planar_arm
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -225,22 +225,6 @@ _LOWER_TO_TARGET_END = 990  # +60 (1.0s)
 _RELEASE_END = 1050  # +60 (1.0s)
 _LIFT_GRIPPER_END = 1110  # +60 (1.0s)
 _TOTAL_STEPS = 1410  # +300 (5.0s): return home, ends the episode
-
-# DEBUG: (step, phase-name) pairs used by the diagnostic print in get_action() -- remove once the
-# grasp and hold posture are confirmed correct in sim.
-_PHASE_START_NAMES = (
-    (0, "approach_hover"),
-    (_APPROACH_STEPS, "lower_to_cube"),
-    (_LOWER_TO_CUBE_END, "grasp"),
-    (_GRASP_END, "lift_cube"),
-    (_LIFT_CUBE_END, "move_to_middle"),
-    (_MOVE_TO_MIDDLE_END, "hold_middle"),
-    (_HOLD_MIDDLE_END, "move_above_target"),
-    (_MOVE_ABOVE_TARGET_END, "lower_to_target"),
-    (_LOWER_TO_TARGET_END, "release"),
-    (_RELEASE_END, "lift_gripper"),
-    (_LIFT_GRIPPER_END, "return_home"),
-)
 
 
 def _ease(alpha: float) -> float:
@@ -721,8 +705,6 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             # not to read the gripper because of it -- see ``_SUCCESS_GRIPPER_THRESHOLD``.
             gripper = self._ease_scalar(_GRIPPER_OPEN_RAD, _GRIPPER_REST_RAD, progress)
 
-        self._log_phase_start(env, robot, step, arm, gripper)
-
         gripper_cmd = torch.full((env.num_envs, 1), gripper, device=env.device)
         return torch.cat([arm, gripper_cmd], dim=-1)
 
@@ -839,53 +821,6 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
     def _ease_scalar(start: float, end: float, alpha: float) -> float:
         """Ease a single joint angle. Used for the gripper, which is commanded as a scalar."""
         return start + (end - start) * _ease(alpha)
-
-    def _log_phase_start(self, env, robot, step: int, arm: torch.Tensor, gripper: float) -> None:
-        """DEBUG: report the commanded and achieved state at each phase boundary.
-
-        The gripper's commanded-versus-achieved pair is the one that says whether the jaws are
-        actually bearing on the cube: on a free joint the two agree, while a held cube keeps the
-        joint open of its command by however far the grip is squeezing.
-
-        Remove once the grasp and hold posture are confirmed correct in sim.
-        """
-        phase_name = next((name for boundary, name in _PHASE_START_NAMES if boundary == step), None)
-        if phase_name is None:
-            return
-        jaw_pos_w = env.scene["ee_frame"].data.target_pos_w[:, 1, :]
-        cube_pos_w = env.scene["cube"].data.root_pos_w
-        commanded = {name: float(arm[0, idx]) for idx, name in enumerate(self._arm_names)}
-        pitches = self._model.pitches_from_joints(
-            commanded["shoulder_lift"], commanded["elbow_flex"], commanded["wrist_flex"]
-        )
-        measured = robot.data.joint_pos[0, self._arm_indices]
-        print(
-            f"[LiftCubePickPlace][step={step}] entering phase={phase_name!r} "
-            f"cube_pos={cube_pos_w[0].tolist()} jaw_pos={jaw_pos_w[0].tolist()} "
-            f"jaw_minus_cube={(jaw_pos_w[0] - cube_pos_w[0]).tolist()} "
-            f"joints={self._arm_names} "
-            f"cmd_deg={[round(math.degrees(float(value)), 1) for value in arm[0]]} "
-            f"actual_deg={[round(math.degrees(float(value)), 1) for value in measured]} "
-            f"gripper_cmd_deg={math.degrees(gripper):.1f} "
-            f"gripper_actual_deg={math.degrees(float(robot.data.joint_pos[0, self._gripper_index])):.1f} "
-            f"cmd_link_pitch_deg={[round(math.degrees(wrap_to_pi(value)), 1) for value in pitches]} "
-            f"jaw_heading_deg={math.degrees(self._model.finger_azimuth(commanded['shoulder_pan'])):.1f} "
-            f"cube_heading_deg={math.degrees(self._cube_heading(env, robot)):.1f}"
-        )
-
-    @staticmethod
-    def _cube_heading(env, robot) -> float:
-        """Base-frame heading of the cube's own X axis, i.e. which way its faces point.
-
-        Reported only, for now. The cube spawns with up to 30 deg of yaw, so the jaws can meet it
-        corner-on rather than face-on; comparing this with ``jaw_heading_deg`` modulo 90 deg says
-        by how much.
-        """
-        cube_quat_w = env.scene["cube"].data.root_quat_w
-        axis = torch.zeros_like(cube_quat_w[:, :3])
-        axis[:, 0] = 1.0
-        axis_b = quat_apply(quat_inv(robot.data.root_quat_w), quat_apply(cube_quat_w, axis))
-        return float(torch.atan2(axis_b[0, 1], axis_b[0, 0]))
 
     # ------------------------------------------------------------------
     # Properties
