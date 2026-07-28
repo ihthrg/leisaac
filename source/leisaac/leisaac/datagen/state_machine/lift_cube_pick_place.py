@@ -169,9 +169,21 @@ _RELEASE_CLEARANCE = 0.03
 the markers sit slightly below the cube's resting centre height, so this drops the cube from just
 above the marker."""
 
-_GRASP_DEPTH_BELOW_CENTER = 0.005
-"""How far (m) below the cube's centre the jaw is aimed, so the fingers straddle the cube rather
-than grazing its top face."""
+_FINGER_TABLE_CLEARANCE = 0.008
+"""Height (m) the lowest fingertip is kept above the table while gripping.
+
+The descent aims the tracked point at ``table + this + finger_drop``, where ``finger_drop`` is
+measured in ``setup()`` -- see ``_measure_finger_drop``. Fixing a depth below the cube's centre
+instead, as earlier revisions did, assumes the tracked point sits at the same height as the
+fingertips. It does not: the jaws sweep 57 deg, and a third of that motion is vertical, so the
+tracked point rides about a centimetre above the fingers. In sim that put the fingertip 1 mm off
+the table and the arm ended up standing on it -- after 3.5 s of a *static* grasp command,
+``shoulder_lift`` was still 2.9 deg short of it, while the same arm tracks its commands exactly in
+free air.
+
+8 mm is generous against the calibration's own few-millimetre residual and costs nothing: the
+fingers are far longer than the cube is tall, so they still straddle it from well below its
+mid-height."""
 
 # Phase boundaries (state-machine step count). Each `env.step()` advances physics by one sim tick,
 # so a 60Hz simulation (`--step_hz 60`) needs `round(seconds * 60)` steps for the intended
@@ -279,6 +291,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._grip_contact: tuple[int, float] = (0, _GRIPPER_CLOSE_RAD)
         self._grip_last_pos: float | None = None
         self._grip_stalled_steps: int = 0
+        self._finger_drop: float = 0.0
         self._start_arm: torch.Tensor | None = None
         self._home_start_arm: torch.Tensor | None = None
         self._cube_pos_w: torch.Tensor | None = None
@@ -398,6 +411,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._rest_arm = self._arm_command(env, {name: math.radians(_REST_POSE_DEG[name]) for name in self._arm_names})
 
         self._center_x = float(env.cfg.scene.cube.init_state.pos[0])
+        self._finger_drop = self._measure_finger_drop(env, robot, probe)
 
         # DEBUG: report the measured model and check that the hold posture actually lands where the
         # model says it should -- remove together with the per-phase print once confirmed in sim.
@@ -415,7 +429,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             f"elbow_flex={math.degrees(hold_elbow):.2f} wrist_flex={math.degrees(hold_wrist_flex):.2f} "
             f"-> link pitches {_HOLD_LINK_PITCHES_DEG} deg, jaw at forward={predicted[0]:.4f} "
             f"height={predicted[1]:.4f} m, model-vs-measured residual={residual * 1000.0:.1f} mm, "
-            f"center_x={self._center_x}"
+            f"finger_drop={self._finger_drop * 1000.0:.1f} mm, center_x={self._center_x}"
         )
         if residual > _CALIB_RESIDUAL_WARN:
             print(
@@ -423,6 +437,30 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
                 f"{residual * 1000.0:.1f} mm at the hold pose. Every jaw target will be off by roughly that "
                 "much; check that the calibration probes are being held steady."
             )
+
+    def _measure_finger_drop(self, env, robot, probe) -> float:
+        """How far (m) the lowest fingertip hangs below the point the model tracks.
+
+        The model tracks a point part-way along the closed-to-open fingertip segment. That segment
+        is far from horizontal -- the jaws sweep 57 deg, and a third of the fingertip's travel is
+        vertical -- so the tracked point rides well above the fingers themselves. Aiming it at a
+        fixed depth below the cube's centre therefore drives the fingers into the table, which is
+        exactly what happened: the fingertip ended up 1 mm above the table and the arm stood on it.
+
+        Measured, not derived, and measured in the pose it matters in: the arm is driven to the
+        configuration the grasp actually uses, and the two fingertips are read there. Both are
+        checked because which one is lower depends on the gripper angle, and the jaws pass through
+        the whole range during the grasp.
+        """
+        target_w = env.scene["cube"].data.root_pos_w.clone()
+        solution = self._solve_arm(robot, target_w)
+        angles = {name: float(solution[0, idx]) for idx, name in enumerate(self._arm_names)}
+        probe_deg = tuple(math.degrees(angles[name]) for name in _PROBE_JOINT_NAMES)
+
+        closed_tip = probe(*probe_deg, _WRIST_ROLL_DEG, math.degrees(_GRIPPER_CLOSE_RAD))[0]
+        open_tip = probe(*probe_deg, _WRIST_ROLL_DEG, math.degrees(_GRIPPER_OPEN_RAD))[0]
+        tracked_z = closed_tip[2] + self._model.grasp_fraction * (open_tip[2] - closed_tip[2])
+        return tracked_z - min(closed_tip[2], open_tip[2])
 
     def check_success(self, env) -> bool:
         """Return True if the cube is on its correct target and the arm is at rest."""
@@ -501,7 +539,9 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             return self._solve_arm(robot, jaw_target_w)
 
         hover = raised(self._cube_pos_w, _HOVER_CLEARANCE)
-        grasp = raised(self._cube_pos_w, -_GRASP_DEPTH_BELOW_CENTER)
+        # Referenced to the table the cube sits on, not to the cube's centre, because what must
+        # not collide is the fingertip and what it must not collide with is the table.
+        grasp = raised(self._cube_pos_w, self._finger_drop + _FINGER_TABLE_CLEARANCE - 0.5 * _CUBE_SIZE)
         lifted = raised(self._cube_pos_w, _HOLD_HEIGHT_ABOVE_TABLE)
         place_hover = raised(place_pos_w, _HOLD_HEIGHT_ABOVE_TABLE)
         place_release = raised(place_pos_w, _RELEASE_CLEARANCE)
