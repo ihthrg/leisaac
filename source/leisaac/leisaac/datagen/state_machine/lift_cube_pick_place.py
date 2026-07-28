@@ -59,6 +59,15 @@ fingers are still shoving the cube across the table, long before they pin it. In
 is the signature of a lag that grew into it rather than of the cube stopping anything. How fast
 the joint is still closing needs no such calibration: free it tracks the ramp, blocked it stops."""
 
+_EMPTY_GRIP_MARGIN = math.radians(5.0)
+"""How far clear of their own closed stop the jaws must halt for the cube to be in them.
+
+The stall detector cannot tell "stopped by the cube" from "stopped by the other finger" -- both
+simply stop the joint. Measured over 22 sim episodes the two are nowhere near each other: the jaws
+shut on air halted between 2.6 and 3.1 deg, while every real grasp halted between 14.0 and
+20.6 deg. This margin sits in that empty band, ten times the 0.5 deg spread of the closed stop and
+still 9 deg below the tightest real grasp."""
+
 _GRIP_SQUEEZE_RAD = 0.20
 """Interference held past the angle the cube stopped the jaws at.
 
@@ -306,12 +315,14 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._gripper_index: int = -1
         self._grip_hold: torch.Tensor | None = None
         self._grip_latched: torch.Tensor | None = None
+        self._grip_stall: torch.Tensor | None = None
         self._grip_contact_step: torch.Tensor | None = None
         self._grip_contact_command: torch.Tensor | None = None
         self._grip_last_pos: torch.Tensor | None = None
         self._grip_stalled_steps: torch.Tensor | None = None
         self._finger_drop: float = 0.0
         self._table_bite: float = 0.0
+        self._empty_grip: float = 0.0
         self._start_arm: torch.Tensor | None = None
         self._home_start_arm: torch.Tensor | None = None
         self._cube_pos_w: torch.Tensor | None = None
@@ -450,6 +461,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._center_x = float(env.cfg.scene.cube.init_state.pos[0])
         self._finger_drop = self._measure_finger_drop(env, robot, probe)
         self._table_bite = self._measure_table_bite(env, robot, write_pose, drive_pose)
+        self._empty_grip = self._measure_empty_grip(env, robot, write_pose, drive_pose)
 
         # DEBUG: report the measured model and check that the hold posture actually lands where the
         # model says it should -- remove together with the per-phase print once confirmed in sim.
@@ -468,6 +480,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             f"-> link pitches {_HOLD_LINK_PITCHES_DEG} deg, jaw at forward={predicted[0]:.4f} "
             f"height={predicted[1]:.4f} m, model-vs-measured residual={residual * 1000.0:.1f} mm, "
             f"finger_drop={self._finger_drop * 1000.0:.1f} mm, table_bite={self._table_bite * 1000.0:.1f} mm, "
+            f"empty_grip={math.degrees(self._empty_grip):.1f} deg, "
             f"center_x={self._center_x}"
         )
         if residual > _CALIB_RESIDUAL_WARN:
@@ -507,6 +520,27 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         open_tip = probe(*probe_deg, _WRIST_ROLL_DEG, math.degrees(_GRIPPER_OPEN_RAD))[0]
         tracked_z = closed_tip[2] + self._model.grasp_fraction * (open_tip[2] - closed_tip[2])
         return tracked_z - min(closed_tip[2], open_tip[2])
+
+    def _measure_empty_grip(self, env, robot, write_pose, drive_pose) -> float:
+        """Gripper angle (rad) the jaws come to rest at with nothing between them.
+
+        The stall detector cannot tell "stopped by the cube" from "stopped by the other finger":
+        both simply stop the joint, and in sim the second one was recorded as a successful pick
+        three times. Measuring where the empty jaws stop gives ``check_success`` something to
+        compare the grasp against.
+
+        Driven rather than teleported, and in free air above the cube, for the same reason as the
+        table probe: teleporting places the joint at the commanded angle and reports it as reached,
+        which is precisely the reading that has to be avoided.
+        """
+        hover_w = env.scene["cube"].data.root_pos_w.clone()
+        hover_w[:, 2] += _HOVER_CLEARANCE
+        solution = self._solve_arm(robot, hover_w)
+        pose = {name: math.degrees(float(solution[0, idx])) for idx, name in enumerate(self._arm_names)}
+        write_pose({**pose, "gripper": math.degrees(_GRIPPER_OPEN_RAD)})
+        # Same settle time as the table probe -- long enough for the joint to stop moving.
+        drive_pose({**pose, "gripper": math.degrees(_GRIPPER_CLOSE_RAD)}, _TABLE_PROBE_SETTLE_STEPS)
+        return float(robot.data.joint_pos[0, self._gripper_index])
 
     def _measure_table_bite(self, env, robot, write_pose, drive_pose) -> float:
         """How much (m) the grasp height has to rise for the gripper to stop touching the table.
@@ -574,7 +608,14 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         return bite
 
     def check_success(self, env) -> torch.Tensor:
-        """Return, for each environment, whether the cube is on its correct target and the arm is at rest."""
+        """Return, for each environment, whether the cube was picked up and left on its target.
+
+        The placement test alone is not enough. In sim it passed three times on episodes whose
+        jaws shut on empty air -- the cube reached the marker without ever being gripped -- and
+        those were recorded as demonstrations of picking it up. So the grasp has to be shown as
+        well: the jaws must have stalled, and stalled clear of the point they stop at when there
+        is nothing between them.
+        """
         placed = cube_placed_on_correct_target(
             env,
             cube_cfg=SceneEntityCfg("cube"),
@@ -594,7 +635,14 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             env.scene.update(dt=env.physics_dt)
         at_rest = _is_at_rest(robot.data.joint_pos, robot.data.joint_names)
 
-        return torch.logical_and(placed, at_rest)
+        held = torch.logical_and(self._grip_latched, self._grip_stall > self._empty_grip + _EMPTY_GRIP_MARGIN)
+        for env_id in torch.logical_and(torch.logical_and(placed, at_rest), ~held).nonzero().flatten().tolist():
+            print(
+                f"[LiftCubePickPlace][env={env_id}] the cube ended up on its target, but the jaws stalled at "
+                f"{math.degrees(float(self._grip_stall[env_id])):.1f} deg against an empty-jaw stop of "
+                f"{math.degrees(self._empty_grip):.1f} deg, so nothing was ever gripped. Not recording it."
+            )
+        return torch.logical_and(torch.logical_and(placed, at_rest), held)
 
     def pre_step(self, env) -> None:
         """Snap to the rest pose before the first step of an episode.
@@ -636,6 +684,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             self._start_arm = robot.data.joint_pos[:, self._arm_indices].clone()
             self._grip_hold = torch.full((env.num_envs,), _GRIPPER_CLOSE_RAD, device=env.device)
             self._grip_latched = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            self._grip_stall = torch.full((env.num_envs,), _GRIPPER_CLOSE_RAD, device=env.device)
             self._grip_contact_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
             self._grip_contact_command = torch.full((env.num_envs,), _GRIPPER_CLOSE_RAD, device=env.device)
             self._grip_stalled_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -744,6 +793,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._target_is_circle = None
         self._grip_hold = None
         self._grip_latched = None
+        self._grip_stall = None
         self._grip_contact_step = None
         self._grip_contact_command = None
         self._grip_last_pos = None
@@ -798,6 +848,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         if bool(stalled.any()):
             hold = torch.clamp(achieved - _GRIP_SQUEEZE_RAD, min=_GRIPPER_CLOSE_RAD)
             self._grip_hold = torch.where(stalled, hold, self._grip_hold)
+            self._grip_stall = torch.where(stalled, achieved, self._grip_stall)
             self._grip_contact_step = torch.where(
                 stalled, torch.full_like(self._grip_contact_step, step), self._grip_contact_step
             )

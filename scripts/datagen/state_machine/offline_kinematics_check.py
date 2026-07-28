@@ -400,6 +400,12 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     # Nothing obstructs the synthetic arm, so the table probe must report nothing. A reading here
     # would mean it is measuring its own tracking lag rather than an obstacle.
     assert abs(machine._table_bite) < 1.0e-6, machine._table_bite
+    # Nothing between the synthetic jaws either, so they must reach the closed command exactly.
+    # A grasp that stalls here would be indistinguishable from one that closed on air.
+    assert abs(machine._empty_grip - lcpp._GRIPPER_CLOSE_RAD) < 1.0e-6, machine._empty_grip
+    # The stall this run recorded must clear that empty stop, or the episode would be thrown away
+    # as a cube that was never gripped.
+    assert float(machine._grip_stall[0]) > machine._empty_grip + lcpp._EMPTY_GRIP_MARGIN, machine._grip_stall
     expected_hold = max(blocking - lcpp._GRIP_SQUEEZE_RAD, lcpp._GRIPPER_CLOSE_RAD)
     assert abs(float(machine._grip_hold[0]) - expected_hold) < 1.0e-9, machine._grip_hold
     assert abs(grasp_end_command - float(machine._grip_hold[0])) < 1.0e-6, grasp_end_command
@@ -427,6 +433,7 @@ def run_parallel_gripper(blocking_deg, label):
     machine._gripper_index = 5
     machine._grip_hold = torch.full((num_envs,), lcpp._GRIPPER_CLOSE_RAD, dtype=torch.float64)
     machine._grip_latched = torch.zeros(num_envs, dtype=torch.bool)
+    machine._grip_stall = torch.full((num_envs,), lcpp._GRIPPER_CLOSE_RAD, dtype=torch.float64)
     machine._grip_contact_step = torch.zeros(num_envs, dtype=torch.long)
     machine._grip_contact_command = torch.full((num_envs,), lcpp._GRIPPER_CLOSE_RAD, dtype=torch.float64)
     machine._grip_stalled_steps = torch.zeros(num_envs, dtype=torch.long)
@@ -451,6 +458,7 @@ def run_parallel_gripper(blocking_deg, label):
         f"{[int(v) for v in machine._grip_contact_step]}"
     )
     assert bool(machine._grip_latched.all()), machine._grip_latched
+    assert torch.allclose(machine._grip_stall, blocking, atol=1.0e-9), machine._grip_stall
     assert torch.allclose(machine._grip_hold, expected, atol=1.0e-9), machine._grip_hold
     # Settling must be finished by the end of the phase, in every environment.
     assert torch.allclose(command, machine._grip_hold, atol=1.0e-9), command
