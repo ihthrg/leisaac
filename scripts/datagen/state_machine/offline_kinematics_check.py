@@ -392,9 +392,10 @@ def run(cube_pos, truth_lengths, truth_offsets_deg, truth_signs, label):
     # The jaws must notice the cube and then bear on it, and must have finished settling onto it
     # before the phase that lifts it begins.
     assert machine._grip_hold is not None, "the state machine never noticed the cube"
-    assert abs(machine._grip_hold - (blocking - lcpp._GRIP_SQUEEZE_RAD)) < 1.0e-9, machine._grip_hold
+    expected_hold = max(blocking - lcpp._GRIP_SQUEEZE_RAD, lcpp._GRIPPER_CLOSE_RAD)
+    assert abs(machine._grip_hold - expected_hold) < 1.0e-9, machine._grip_hold
     assert abs(grasp_end_command - machine._grip_hold) < 1.0e-6, grasp_end_command
-    assert 0.001 < squeeze < 0.010, squeeze
+    assert squeeze > 0.005, squeeze
     assert abs(first_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-6, first_gripper
     assert abs(last_gripper - lcpp._GRIPPER_REST_RAD) < 1.0e-3, last_gripper
     assert max(abs(a - b) for a, b in zip(hold_pitches, [90.0, 0.0, 0.0])) < 1.0e-3, hold_pitches

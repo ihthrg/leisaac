@@ -31,38 +31,51 @@ be -- see ``_GRIP_CONTACT_LAG_RAD`` below."""
 _CUBE_SIZE = 0.03
 """Edge length (m) of the cube this task picks up."""
 
-_GRIP_CONTACT_LAG_RAD = 0.12
-"""How far the gripper joint may fall behind its command before the cube is deemed to be in the way.
+_CUBE_HALF_SPAN = 0.5 * _CUBE_SIZE * math.sqrt(2.0)
+"""Half the cube's widest horizontal silhouette, i.e. across its diagonal.
 
-The jaws are closed by ramping the command shut and watching the joint follow it. Free, the joint
-trails the ramp by roughly ``rate * damping / stiffness``, which the ramp rate is chosen to keep
-near 0.07 rad; once the cube blocks it the gap grows without bound. This sits between the two.
+The cube spawns with up to 30 deg of yaw and the jaws take no notice of it, so the half-width the
+fingers actually meet is anywhere between ``_CUBE_SIZE / 2`` and this. Clearances have to assume
+the worst of the two, or the descent puts a finger through a corner."""
 
-Closing to a *measured* width was tried first and does not work. Isaac Sim only reports the moving
-finger, so a commanded width is only as good as the assumption that the stationary finger's face
-sits exactly where the moving one rests when shut. In sim it does not: aiming for a 28 mm grip on
-the 30 mm cube left the jaws wide enough that the cube was merely nudged 5 mm across and never
-pinched. Closing onto the object needs no such assumption, and adapts to whatever it finds."""
+_GRIP_STALL_FRACTION = 0.25
+_GRIP_STALL_STEPS = 5
+_GRIP_STALL_BLANKING_STEPS = 20
+"""Stall test: the jaws have met something once the joint has closed by less than
+``_GRIP_STALL_FRACTION`` of a step's worth of ramp for ``_GRIP_STALL_STEPS`` steps in a row,
+ignoring the first ``_GRIP_STALL_BLANKING_STEPS`` while the joint is still picking up speed.
 
-_GRIP_SQUEEZE_RAD = 0.05
+How far the joint *lags* its command was tried first and cannot be thresholded. That lag is
+``rate * damping / stiffness`` plus whatever the jaws are pushing against, so it grows while the
+fingers are still shoving the cube across the table, long before they pin it. In sim it tripped at
+20.1, 20.6 and 20.7 deg on three different cube poses -- each time at exactly the threshold, which
+is the signature of a lag that grew into it rather than of the cube stopping anything. How fast
+the joint is still closing needs no such calibration: free it tracks the ramp, blocked it stops."""
+
+_GRIP_SQUEEZE_RAD = 0.20
 """Interference held past the angle the cube stopped the jaws at.
 
-The actuator is position controlled, so this is what sets the grip force: about
-``stiffness * this`` = 0.9 N m, which at the finger's ~7 cm radius is over ten newtons of pinch --
-ample for a light cube, and far short of commanding the jaws fully shut, which would try to drive
-them 0.5 rad into it."""
+The actuator is position controlled, so this sets the grip force: ``stiffness * this`` = 3.6 N m,
+about 50 N at the finger's ~7 cm radius, well inside the 10 N m effort limit.
+
+That is far more than is needed to carry a light cube, and deliberately so. The cube is grasped
+with up to 30 deg of yaw on it, so the jaws close on a corner rather than a face; a finger bearing
+on a corner torques the cube towards lying flat against it, and the sim logs show exactly that
+happening -- 23.7 deg of misalignment became 8.1 deg during the grasp. What they also show is the
+rotation stopping part-way, leaving the cube cocked and free to slip out. The grip has to be firm
+enough to finish turning the cube against table friction, not merely to hold it once turned."""
 
 _GRIP_SETTLE_STEPS = 30
 """Steps (0.5s) spent easing the command back from where contact was noticed to the squeeze."""
 
 _GRASP_FACE_CLEARANCE = 0.005
-"""Gap (m) left between the stationary finger and the cube face while descending.
+"""Gap (m) left between the stationary finger and the cube while descending.
 
-The tracked point sits ``_CUBE_SIZE / 2 + this`` from the stationary finger, rather than in the
+The tracked point sits ``_CUBE_HALF_SPAN + this`` from the stationary finger, rather than in the
 middle of the jaws. Both keep the cube off the stationary finger on the way down, but the middle
 is needlessly far: the moving finger then has to travel the whole way in before it touches, and
 shoves the cube ahead of it until it pins. Measured in sim at the midpoint, that shove was 18 mm;
-from here it is 5 mm."""
+from here it is a few."""
 
 _GRIPPER_REST_RAD = math.radians(-10.0)
 """Gripper angle at rest -- closed, matching ``_REST_POSE_DEG``.
@@ -257,6 +270,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._gripper_index: int = -1
         self._grip_hold: float | None = None
         self._grip_contact: tuple[int, float] = (0, _GRIPPER_CLOSE_RAD)
+        self._grip_last_pos: float | None = None
+        self._grip_stalled_steps: int = 0
         self._start_arm: torch.Tensor | None = None
         self._home_start_arm: torch.Tensor | None = None
         self._cube_pos_w: torch.Tensor | None = None
@@ -358,7 +373,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             wrist_roll_deg=_WRIST_ROLL_DEG,
             gripper_closed_deg=math.degrees(_GRIPPER_CLOSE_RAD),
             gripper_open_deg=math.degrees(_GRIPPER_OPEN_RAD),
-            grasp_offset=0.5 * _CUBE_SIZE + _GRASP_FACE_CLEARANCE,
+            grasp_offset=_CUBE_HALF_SPAN + _GRASP_FACE_CLEARANCE,
         )
         self._gripper_index = joint_names.index("gripper")
 
@@ -538,7 +553,7 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             # not to read the gripper because of it -- see ``_SUCCESS_GRIPPER_THRESHOLD``.
             gripper = self._ease_scalar(_GRIPPER_OPEN_RAD, _GRIPPER_REST_RAD, progress)
 
-        self._log_phase_start(env, robot, step, arm)
+        self._log_phase_start(env, robot, step, arm, gripper)
 
         gripper_cmd = torch.full((env.num_envs, 1), gripper, device=env.device)
         return torch.cat([arm, gripper_cmd], dim=-1)
@@ -559,6 +574,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         self._target_is_circle = None
         self._grip_hold = None
         self._grip_contact = (0, _GRIPPER_CLOSE_RAD)
+        self._grip_last_pos = None
+        self._grip_stalled_steps = 0
 
     # ------------------------------------------------------------------
 
@@ -573,34 +590,41 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         return _GRIPPER_CLOSE_RAD if self._grip_hold is None else self._grip_hold
 
     def _closing_gripper(self, robot, step: int) -> float:
-        """Ramp the jaws shut, stop at whatever they land on, and hold a fixed squeeze on it.
+        """Ramp the jaws shut, stop at whatever they land on, and hold a firm squeeze on it.
 
-        The ramp is linear rather than eased so its rate -- and hence how far the joint lags behind
-        it while it is still free to move -- stays constant and predictable; a smooth start is
-        worth nothing here since the jaws are closing on empty air for the first half of it.
+        The ramp is linear rather than eased so the joint's free-running speed -- which is what
+        contact is judged against -- stays constant instead of varying through the phase.
 
-        Contact is only noticed once the command has already been driven ``_GRIP_CONTACT_LAG_RAD``
-        past what the joint could reach, so the command is walked back to the squeeze over
-        ``_GRIP_SETTLE_STEPS`` rather than dropped there in one step, which would jolt the cube
-        just as it is being taken hold of.
+        Contact is only noticed once the joint has been standing still for a few steps, by which
+        time the command has already been driven past it, so the command is walked on to the
+        squeeze over ``_GRIP_SETTLE_STEPS`` rather than jumped there, which would snatch at the
+        cube just as it is being taken hold of.
 
         The command is one scalar for every environment, so contact is taken from whichever jaws
         stall first. With only the cube's pose randomised they all block within a hair of each
         other, so that is also the angle the rest want.
         """
         if self._grip_hold is None:
-            progress = min((step - _LOWER_TO_CUBE_END) / _GRASP_CLOSE_STEPS, 1.0)
-            command = _GRIPPER_OPEN_RAD + (_GRIPPER_CLOSE_RAD - _GRIPPER_OPEN_RAD) * progress
-            # Measured before this step's command is applied, so it reflects the previous one; the
-            # ramp moves far less than the contact threshold per step, so that costs nothing.
+            elapsed = step - _LOWER_TO_CUBE_END
+            rate = (_GRIPPER_OPEN_RAD - _GRIPPER_CLOSE_RAD) / _GRASP_CLOSE_STEPS
+            command = _GRIPPER_OPEN_RAD - rate * min(elapsed, _GRASP_CLOSE_STEPS)
+            # Measured before this step's command is applied, so it reflects the previous one.
             achieved = float(robot.data.joint_pos[:, self._gripper_index].max())
-            if achieved - command <= _GRIP_CONTACT_LAG_RAD:
+            closed_by = achieved if self._grip_last_pos is None else self._grip_last_pos - achieved
+            self._grip_last_pos = achieved
+
+            if elapsed < _GRIP_STALL_BLANKING_STEPS or closed_by > _GRIP_STALL_FRACTION * rate:
+                self._grip_stalled_steps = 0
                 return command
-            self._grip_hold = achieved - _GRIP_SQUEEZE_RAD
+            self._grip_stalled_steps += 1
+            if self._grip_stalled_steps < _GRIP_STALL_STEPS:
+                return command
+
+            self._grip_hold = max(achieved - _GRIP_SQUEEZE_RAD, _GRIPPER_CLOSE_RAD)
             self._grip_contact = (step, command)
             print(
-                f"[LiftCubePickPlace] jaws stopped at gripper={math.degrees(achieved):.1f} deg with the command "
-                f"at {math.degrees(command):.1f} deg; settling to {math.degrees(self._grip_hold):.1f} deg"
+                f"[LiftCubePickPlace] jaws stalled at gripper={math.degrees(achieved):.1f} deg with the command "
+                f"at {math.degrees(command):.1f} deg; squeezing to {math.degrees(self._grip_hold):.1f} deg"
             )
 
         contact_step, contact_command = self._grip_contact
@@ -648,8 +672,12 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
         """Ease a single joint angle. Used for the gripper, which is commanded as a scalar."""
         return start + (end - start) * _ease(alpha)
 
-    def _log_phase_start(self, env, robot, step: int, arm: torch.Tensor) -> None:
+    def _log_phase_start(self, env, robot, step: int, arm: torch.Tensor, gripper: float) -> None:
         """DEBUG: report the commanded and achieved state at each phase boundary.
+
+        The gripper's commanded-versus-achieved pair is the one that says whether the jaws are
+        actually bearing on the cube: on a free joint the two agree, while a held cube keeps the
+        joint open of its command by however far the grip is squeezing.
 
         Remove once the grasp and hold posture are confirmed correct in sim.
         """
@@ -670,6 +698,8 @@ class LiftCubePickPlaceStateMachine(StateMachineBase):
             f"joints={self._arm_names} "
             f"cmd_deg={[round(math.degrees(float(value)), 1) for value in arm[0]]} "
             f"actual_deg={[round(math.degrees(float(value)), 1) for value in measured]} "
+            f"gripper_cmd_deg={math.degrees(gripper):.1f} "
+            f"gripper_actual_deg={math.degrees(float(robot.data.joint_pos[0, self._gripper_index])):.1f} "
             f"cmd_link_pitch_deg={[round(math.degrees(wrap_to_pi(value)), 1) for value in pitches]} "
             f"jaw_heading_deg={math.degrees(self._model.finger_azimuth(commanded['shoulder_pan'])):.1f} "
             f"cube_heading_deg={math.degrees(self._cube_heading(env, robot)):.1f}"
