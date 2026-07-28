@@ -15,6 +15,7 @@ if multiprocessing.get_start_method() != "spawn":
     multiprocessing.set_start_method("spawn", force=True)
 
 import argparse
+import math
 import os
 import signal
 import time
@@ -227,6 +228,47 @@ def _on_episode_done(env, sm, args_cli, resume_recorded_demo_count, current_reco
     return current_recorded_demo_count, start_record_state, False
 
 
+def _tile_grid(num_envs: int) -> tuple[int, int]:
+    """Return the (columns, rows) Isaac Lab will use to pack every environment's camera into one buffer.
+
+    Mirrors ``isaaclab_ov/renderers/ovrtx_usd.py::_tiled_resolution``.
+    """
+    columns = math.ceil(math.sqrt(num_envs))
+    return columns, math.ceil(num_envs / columns)
+
+
+def _warn_about_lopsided_tiles(num_envs: int) -> None:
+    """Warn when the tiled render buffer will not have the cameras' own aspect ratio.
+
+    Isaac Lab renders every environment's camera into a single buffer of ``columns * width`` by
+    ``rows * height``, so the buffer is the camera's shape multiplied by ``columns / rows``. When
+    those are not equal the renderer loses detail along one axis, and nothing downstream says so:
+    the images come out the right size and merely look soft.
+
+    Measured with ``image_sharpness_check.py``, the vertical/horizontal detail ratio of a recording
+    was 0.70 at ``--num_envs 1`` (a 1x1 grid), fell to 0.41 at ``--num_envs 2`` (2x1, a buffer
+    twice as wide as it is tall relative to the camera), and returned to 0.70 at ``--num_envs 4``
+    (2x2). ``--quality`` did not recover it. So parallelism is not the problem -- the tile layout
+    is, and it costs nothing to pick a count that squares up.
+    """
+    columns, rows = _tile_grid(num_envs)
+    if columns == rows:
+        return
+
+    # A lopsided grid always has fewer rows than columns, so the nearest square grids are the ones
+    # that fill (columns - 1) and columns square. Both are suggested full, because a full grid
+    # costs the same to render as a partial one of the same shape.
+    fewer, more = (columns - 1) ** 2, columns**2
+
+    print(
+        f"[generate][warning] --num_envs {num_envs} tiles the cameras {columns}x{rows}, so the render"
+        f" buffer is {columns}/{rows} times the cameras' aspect ratio. Recorded images lose detail"
+        " along one axis when that happens, and they still come out looking like ordinary images."
+        f" Consider --num_envs {fewer} or {more} instead, which tile square."
+        " Check any recording with scripts/datagen/state_machine/image_sharpness_check.py."
+    )
+
+
 def main():
     """Run a state machine in a LeIsaac manipulation environment."""
     task_name = args_cli.task
@@ -241,6 +283,9 @@ def main():
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
+    if args_cli.record:
+        _warn_about_lopsided_tiles(args_cli.num_envs)
+
     env_cfg = parse_env_cfg(task_name, device=args_cli.device, num_envs=args_cli.num_envs)
     env_cfg.use_teleop_device(device)
     env_cfg.seed = args_cli.seed if args_cli.seed is not None else int(time.time())
@@ -248,9 +293,9 @@ def main():
     if args_cli.quality:
         # Matches teleop_se3_agent.py. This script accepted --quality and then ignored it, so a
         # run asking for better rendering got the default and said nothing about it -- which is
-        # the worst way for a flag to fail, because the output looks like an answer. It matters
-        # here: at --num_envs 2 the recorded images lose about half their vertical detail
-        # (measured by image_sharpness_check.py), and this is the first thing to try against that.
+        # the worst way for a flag to fail, because the output still looks like an answer. Note
+        # that it does not rescue the detail lost to a lopsided tile grid; see
+        # _warn_about_lopsided_tiles for that.
         env_cfg.sim.render.antialiasing_mode = "FXAA"
         env_cfg.sim.render.rendering_mode = "quality"
 
