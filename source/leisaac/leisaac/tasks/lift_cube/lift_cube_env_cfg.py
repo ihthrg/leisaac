@@ -97,19 +97,21 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
         # `front` is inherited from SingleArmTaskSceneCfg but this task now uses
         # wrist + top instead, so drop it from the scene (and thus from recording).
         delete_attribute(self, "front")
-        # Paint the arm black. `spawn_from_usd` binds this material to the robot's root prim with
+        # Paint the arm white. `spawn_from_usd` binds this material to the robot's root prim with
         # `strongerThanDescendants`, so it overrides the per-part materials inside the USD and the
         # whole arm comes out one colour. Only this scene's copy of `SO101_FOLLOWER_CFG` is
         # touched -- `configclass` hands every instance its own deep copy -- so other tasks keep
         # the asset's original appearance.
         #
-        # Roughness is left well below 1.0 on purpose. A fully rough black surface reflects
-        # almost nothing and renders as a flat silhouette, which hides the arm's shape from the
-        # cameras; some specular sheen keeps the links distinguishable.
+        # Neither number is the obvious one. The pick-and-place variant's target markers are pure
+        # white (`TARGET_MARKER_COLOR`), so an arm at (1, 1, 1) would match them exactly and the
+        # two would be hard to tell apart where they overlap; sitting just below that keeps them
+        # separable. And a glossy white surface blows its highlights out to pure white, which
+        # flattens the links in the recorded frames, so the finish is left fairly matte.
         self.robot.spawn.visual_material = sim_utils.PreviewSurfaceCfg(
-            diffuse_color=(0.05, 0.05, 0.05),
+            diffuse_color=(0.9, 0.9, 0.9),
             emissive_color=(0.0, 0.0, 0.0),
-            roughness=0.4,
+            roughness=0.7,
             metallic=0.0,
             opacity=1.0,
         )
