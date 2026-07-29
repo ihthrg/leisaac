@@ -5,10 +5,8 @@ python scripts/datagen/state_machine/generate.py --task LeIsaac-SO101-LiftCubePi
 """
 
 import isaaclab.sim as sim_utils
-import leisaac.enhance.envs.mdp as enhance_mdp
 import torch
 from isaaclab.assets import AssetBaseCfg
-from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
@@ -57,42 +55,6 @@ u20cam_spawn_cfg = sim_utils.FisheyeCameraCfg(
     fisheye_max_fov=130.0,  # 実機公称の対角FOV（現状120.0も要修正）
 )
 
-ARM_SERVO_NAME_PATTERNS = ("sts3215", "servo", "motor")
-"""Case-insensitive substrings that pick out the arm's servo meshes, matched against each mesh's
-prim path below the robot root.
-
-These are a guess, and are meant to be corrected rather than trusted: the SO-101 asset is a binary
-USD whose mesh names cannot be read without Isaac Sim. ``paint_meshes_by_name`` prints both the
-paths it matched and the ones it did not, so one run says whether these are right and shows exactly
-what to use instead if they are not."""
-
-ARM_SERVO_MATERIAL = sim_utils.PreviewSurfaceCfg(
-    diffuse_color=(0.05, 0.05, 0.05),
-    emissive_color=(0.0, 0.0, 0.0),
-    roughness=0.4,
-    metallic=0.0,
-    opacity=1.0,
-)
-"""Near-black finish for the servos.
-
-Not pure black, which clips against shadow, and glossier than the body below because a fully rough
-black surface reflects almost nothing and renders as a flat silhouette; the sheen is what keeps the
-servo bodies readable in the recorded frames."""
-
-ARM_BODY_MATERIAL = sim_utils.PreviewSurfaceCfg(
-    diffuse_color=(0.9, 0.9, 0.9),
-    emissive_color=(0.0, 0.0, 0.0),
-    roughness=0.7,
-    metallic=0.0,
-    opacity=1.0,
-)
-"""Near-white finish for everything else.
-
-Held off pure white because the pick-and-place variant's markers are exactly ``(1, 1, 1)``
-(``TARGET_MARKER_COLOR``) and the arm would be hard to separate from one it is passing over. Matter
-than the servos for the opposite reason to theirs: on a bright surface it is the highlights that
-saturate and flatten the links."""
-
 
 @configclass
 class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
@@ -135,6 +97,24 @@ class LiftCubeSceneCfg(SingleArmTaskSceneCfg):
         # `front` is inherited from SingleArmTaskSceneCfg but this task now uses
         # wrist + top instead, so drop it from the scene (and thus from recording).
         delete_attribute(self, "front")
+        # Paint the arm white. `spawn_from_usd` binds this material to the robot's root prim with
+        # `strongerThanDescendants`, so it overrides the per-part materials inside the USD and the
+        # whole arm comes out one colour. Only this scene's copy of `SO101_FOLLOWER_CFG` is
+        # touched -- `configclass` hands every instance its own deep copy -- so other tasks keep
+        # the asset's original appearance.
+        #
+        # Neither number is the obvious one. The pick-and-place variant's target markers are pure
+        # white (`TARGET_MARKER_COLOR`), so an arm at (1, 1, 1) would match them exactly and the
+        # two would be hard to tell apart where they overlap; sitting just below that keeps them
+        # separable. And a glossy white surface blows its highlights out to pure white, which
+        # flattens the links in the recorded frames, so the finish is left fairly matte.
+        self.robot.spawn.visual_material = sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.9, 0.9, 0.9),
+            emissive_color=(0.0, 0.0, 0.0),
+            roughness=0.7,
+            metallic=0.0,
+            opacity=1.0,
+        )
 
 
 @configclass
@@ -208,25 +188,6 @@ class LiftCubeEnvCfg(SingleArmTaskEnvCfg):
         self.scene.robot.init_state.pos = (0.35, -0.64, 0.01)
 
         parse_usd_and_create_subassets(TABLE_WITH_CUBE_USD_PATH, self)
-
-        # A white arm with black servos needs a material on each mesh, not one on the robot's root
-        # prim: `UsdFileCfg.visual_material` binds `strongerThanDescendants`, which would override
-        # any per-mesh binding underneath it. Done as a startup event because the meshes only exist
-        # once the asset has been spawned.
-        setattr(
-            self.events,
-            "paint_robot",
-            EventTerm(
-                func=enhance_mdp.paint_meshes_by_name,
-                mode="startup",
-                params={
-                    "asset_cfg": SceneEntityCfg("robot"),
-                    "match_patterns": ARM_SERVO_NAME_PATTERNS,
-                    "match_material": ARM_SERVO_MATERIAL,
-                    "default_material": ARM_BODY_MATERIAL,
-                },
-            ),
-        )
 
         domain_randomization(
             self,

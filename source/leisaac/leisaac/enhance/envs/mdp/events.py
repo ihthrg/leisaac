@@ -1,4 +1,3 @@
-from collections.abc import Sequence
 from typing import Literal
 
 import isaaclab.sim as sim_utils
@@ -8,8 +7,6 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import Camera
-from isaaclab.sim.spawners import materials
-from pxr import Usd, UsdGeom
 
 NOMINAL_CAMERA_POSE_ATTR = "_leisaac_nominal_camera_pose"
 """Attribute cached on a camera asset holding its world pose before any randomization."""
@@ -154,87 +151,3 @@ def disable_rigid_body_gravity(
                 prim_path,
                 sim_utils.RigidBodyPropertiesCfg(disable_gravity=True),
             )
-
-
-def paint_meshes_by_name(
-    env: ManagerBasedRLEnv,
-    env_ids: torch.Tensor | None,
-    asset_cfg: SceneEntityCfg,
-    match_patterns: Sequence[str],
-    match_material: materials.VisualMaterialCfg,
-    default_material: materials.VisualMaterialCfg | None = None,
-) -> None:
-    """Give an asset two colours, choosing per mesh by matching its prim path against a name list.
-
-    ``UsdFileCfg.visual_material`` cannot do this. It binds one material to the asset's *root* prim
-    with ``strongerThanDescendants``, and in USD that strength means the ancestor binding beats any
-    binding on a descendant -- so a second material applied to a handful of meshes underneath would
-    simply be ignored, no matter which order the two were authored in. Binding directly on each
-    mesh instead replaces that mesh's own binding, which is the only way to end up with more than
-    one colour.
-
-    Which meshes get ``match_material`` is decided by substring, case-insensitively, against the
-    prim path *below the asset root* -- the whole path rather than the leaf name, so a mesh called
-    ``Mesh`` inside an Xform called ``STS3215`` still matches. Everything else gets
-    ``default_material``, or is left with the appearance the USD ships with when that is ``None``.
-
-    The paths that matched, and the ones that did not, are printed. That is deliberate: the mesh
-    names inside a robot USD are not something the caller can be expected to know up front, and a
-    pattern that quietly matches nothing would otherwise look exactly like one that worked.
-
-    Args:
-        env: The environment instance.
-        env_ids: Unused; present because the event manager passes it.
-        asset_cfg: The asset whose meshes are painted.
-        match_patterns: Case-insensitive substrings. A mesh matches if its path contains any.
-        match_material: Material bound to matching meshes.
-        default_material: Material bound to the rest. ``None`` leaves them untouched.
-    """
-    asset = env.scene[asset_cfg.name]
-    root_paths = sim_utils.find_matching_prim_paths(asset.cfg.prim_path)
-    if not root_paths:
-        raise ValueError(f"No prim matches '{asset.cfg.prim_path}', so '{asset_cfg.name}' cannot be painted.")
-
-    # One material per colour, shared by every environment: the bindings point at these paths, so
-    # nothing is gained by spawning a copy inside each environment's namespace.
-    looks_path = f"/World/Looks/{asset_cfg.name}_paint"
-    match_path = f"{looks_path}/matched"
-    match_material.func(match_path, match_material)
-    default_path = None
-    if default_material is not None:
-        default_path = f"{looks_path}/default"
-        default_material.func(default_path, default_material)
-
-    needles = tuple(pattern.lower() for pattern in match_patterns)
-    stage = sim_utils.get_current_stage()
-    matched: set[str] = set()
-    unmatched: set[str] = set()
-
-    for root_path in root_paths:
-        # `bind_visual_material` skips instanced prims silently, so the meshes have to be real
-        # prims of this stage before any of the bindings below can take effect.
-        sim_utils.make_uninstanceable(root_path)
-        for prim in Usd.PrimRange(stage.GetPrimAtPath(root_path)):
-            if not prim.IsA(UsdGeom.Mesh):
-                continue
-            prim_path = prim.GetPath().pathString
-            relative = prim_path[len(root_path) :]
-            if any(needle in relative.lower() for needle in needles):
-                sim_utils.bind_visual_material(prim_path, match_path)
-                matched.add(relative)
-            else:
-                if default_path is not None:
-                    sim_utils.bind_visual_material(prim_path, default_path)
-                unmatched.add(relative)
-
-    prefix = f"[paint_meshes_by_name][{asset_cfg.name}]"
-    print(f"{prefix} {len(matched)} mesh path(s) matched {list(match_patterns)}, {len(unmatched)} did not.")
-    if matched:
-        print(f"{prefix} matched: {', '.join(sorted(matched))}")
-    else:
-        print(
-            f"{prefix} WARNING: nothing matched, so the asset came out one colour. Pick a substring"
-            " from the mesh paths listed below and pass it in match_patterns."
-        )
-    if not matched or default_path is None:
-        print(f"{prefix} unmatched: {', '.join(sorted(unmatched))}")
